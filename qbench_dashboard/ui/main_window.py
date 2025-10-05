@@ -115,7 +115,7 @@ class MainWindow(QMainWindow):
         self.resize(1280, 720)
         self._apply_dark_palette()
 
-        self.status_label = QLabel("Listo")
+        self.status_label = QLabel("Ready")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet("color: #B0BCD5;")
 
@@ -133,7 +133,7 @@ class MainWindow(QMainWindow):
         self.end_date_edit = self._create_date_edit()
         self._initialize_default_range()
 
-        self.refresh_button = QPushButton("Refrescar")
+        self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh_data)
         self.refresh_button.setFixedWidth(140)
         self.refresh_button.setStyleSheet(
@@ -184,11 +184,11 @@ class MainWindow(QMainWindow):
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(12)
         controls_layout.addStretch()
-        start_label = QLabel("Desde")
+        start_label = QLabel("From")
         start_label.setStyleSheet("color: #B0BCD5; font-size: 14px;")
         controls_layout.addWidget(start_label)
         controls_layout.addWidget(self.start_date_edit)
-        end_label = QLabel("Hasta")
+        end_label = QLabel("To")
         end_label.setStyleSheet("color: #B0BCD5; font-size: 14px;")
         controls_layout.addWidget(end_label)
         controls_layout.addWidget(self.end_date_edit)
@@ -241,7 +241,7 @@ class MainWindow(QMainWindow):
         self.tat_value = QLabel("--")
         self.tat_value.setAlignment(Qt.AlignCenter)
         self.tat_value.setStyleSheet("font-size: 26px; font-weight: 600; color: #60CDF1;")
-        self.tat_label = QLabel("TAT Promedio")
+        self.tat_label = QLabel("Avg TAT")
         self.tat_label.setAlignment(Qt.AlignCenter)
         self.tat_label.setStyleSheet("color: #B0BCD5;")
 
@@ -326,10 +326,10 @@ class MainWindow(QMainWindow):
             return
 
         self._set_loading(True)
-        status_message = "Actualizando..."
+        status_message = "Updating..."
         range_text = self._format_range(start_dt, end_dt)
         if range_text:
-            status_message += f" Rango: {range_text}"
+            status_message += f" Range: {range_text}"
         self._update_status(status_message)
 
         self._thread = QThread(self)
@@ -386,9 +386,9 @@ class MainWindow(QMainWindow):
         end_dt = summary.get("end_date")
         range_text = self._format_range(start_dt, end_dt)
         now = datetime.now(timezone.utc)
-        status_parts = [f"Ultima actualizacion: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"]
+        status_parts = [f"Last update: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"]
         if range_text:
-            status_parts.append(f"Rango: {range_text}")
+            status_parts.append(f"Range: {range_text}")
         self._update_status(" | ".join(status_parts))
 
         samples_series = summary.get("samples_series") or []
@@ -462,9 +462,9 @@ class MainWindow(QMainWindow):
             tzinfo=timezone.utc,
         )
         if end_dt < start_dt:
-            raise ValueError("La fecha inicial no puede ser posterior a la final.")
+            raise ValueError("Start date cannot be after the end date.")
         if end_dt - start_dt > timedelta(days=30):
-            raise ValueError("El rango de fechas no puede superar 30 dias.")
+            raise ValueError("The date range cannot exceed 30 days.")
         return start_dt, end_dt
 
     def _advance_spinner(self) -> None:
@@ -508,7 +508,7 @@ class MainWindow(QMainWindow):
         self.status_label.setText(message)
 
     def _show_error(self, message: str) -> None:
-        self._update_status("Error al actualizar")
+        self._update_status("Update failed")
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Critical)
         box.setWindowTitle("Error")
