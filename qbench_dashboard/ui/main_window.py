@@ -3,7 +3,14 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtCharts import QChart, QChartView, QDateTimeAxis, QLineSeries, QValueAxis
+from PySide6.QtCharts import (
+    QBarCategoryAxis,
+    QBarSeries,
+    QBarSet,
+    QChart,
+    QChartView,
+    QValueAxis,
+)
 from PySide6.QtCore import QDate, QDateTime, QLocale, Qt, QThread, QObject, Signal
 from PySide6.QtGui import QBrush, QCursor, QColor, QPalette, QPainter
 from PySide6.QtWidgets import (
@@ -130,22 +137,21 @@ class MainWindow(QMainWindow):
         legend.setLabelBrush(QBrush(Qt.white))
         legend.setBackgroundVisible(False)
 
-        self.samples_series_line = QLineSeries()
-        self.samples_series_line.setName("Samples")
-        self.samples_series_line.setColor(QColor(0x4C, 0x6E, 0xF5))
+        self.samples_set = QBarSet("Samples")
+        self.samples_set.setColor(QColor(0x4C, 0x6E, 0xF5))
 
-        self.tests_series_line = QLineSeries()
-        self.tests_series_line.setName("Tests")
-        self.tests_series_line.setColor(QColor(0x7E, 0xE7, 0x87))
+        self.tests_set = QBarSet("Tests")
+        self.tests_set.setColor(QColor(0x7E, 0xE7, 0x87))
 
-        self.chart.addSeries(self.samples_series_line)
-        self.chart.addSeries(self.tests_series_line)
+        self.bar_series = QBarSeries()
+        self.bar_series.append(self.samples_set)
+        self.bar_series.append(self.tests_set)
+        self.chart.addSeries(self.bar_series)
 
-        self.time_axis = QDateTimeAxis()
-        self.time_axis.setFormat("MMM d")
-        self.time_axis.setLabelsColor(Qt.white)
-        self.time_axis.setTitleText("Fecha")
-        self.time_axis.setTitleBrush(Qt.white)
+        self.categories_axis = QBarCategoryAxis()
+        self.categories_axis.setLabelsColor(Qt.white)
+        self.categories_axis.setTitleText("Fecha")
+        self.categories_axis.setTitleBrush(Qt.white)
 
         self.value_axis = QValueAxis()
         self.value_axis.setLabelFormat("%d")
@@ -153,20 +159,17 @@ class MainWindow(QMainWindow):
         self.value_axis.setTitleText("Conteo")
         self.value_axis.setTitleBrush(Qt.white)
 
-        self.chart.addAxis(self.time_axis, Qt.AlignBottom)
+        self.chart.addAxis(self.categories_axis, Qt.AlignBottom)
         self.chart.addAxis(self.value_axis, Qt.AlignLeft)
-        self.samples_series_line.attachAxis(self.time_axis)
-        self.samples_series_line.attachAxis(self.value_axis)
-        self.tests_series_line.attachAxis(self.time_axis)
-        self.tests_series_line.attachAxis(self.value_axis)
+        self.bar_series.attachAxis(self.categories_axis)
+        self.bar_series.attachAxis(self.value_axis)
 
         self.chart_view = QChartView(self.chart)
         self.chart_view.setRenderHint(QPainter.Antialiasing, True)
         self.chart_view.setMinimumHeight(320)
         self.chart_view.setStyleSheet("background: rgba(32, 40, 62, 0.6);")
 
-        self.samples_series_line.hovered.connect(lambda point, state: self._on_series_hover(point, state, "Samples"))
-        self.tests_series_line.hovered.connect(lambda point, state: self._on_series_hover(point, state, "Tests"))
+        self.bar_series.hovered.connect(self._on_bar_hover)
 
         controls_layout = QHBoxLayout()
         controls_layout.setSpacing(12)
@@ -373,58 +376,55 @@ class MainWindow(QMainWindow):
         samples_series = summary.get("samples_series") or []
         tests_series = summary.get("tests_series") or []
 
-        self.samples_series_line.clear()
-        self.tests_series_line.clear()
+        daily_counts = {}
+        for dt_value, count in samples_series:
+            if isinstance(dt_value, datetime):
+                day = dt_value.date()
+                daily_counts.setdefault(day, [0, 0])[0] = int(count)
+        for dt_value, count in tests_series:
+            if isinstance(dt_value, datetime):
+                day = dt_value.date()
+                daily_counts.setdefault(day, [0, 0])[1] = int(count)
 
-        axis_datetimes = []
+        if self.samples_set.count() > 0:
+            self.samples_set.remove(0, self.samples_set.count())
+        if self.tests_set.count() > 0:
+            self.tests_set.remove(0, self.tests_set.count())
+
+        sorted_days = sorted(daily_counts.keys())
+        category_labels = []
         max_value = 1
+        for day in sorted_days:
+            sample_count, test_count = daily_counts[day]
+            category_labels.append(day.strftime('%b %d'))
+            self.samples_set.append(float(sample_count))
+            self.tests_set.append(float(test_count))
+            max_value = max(max_value, sample_count, test_count)
 
-        def _populate(series, target):
-            nonlocal max_value
-            for dt_value, count in series:
-                if not isinstance(dt_value, datetime):
-                    continue
-                axis_datetimes.append(dt_value)
-                max_value = max(max_value, int(count))
-                qdt = QDateTime(dt_value)
-                target.append(qdt.toMSecsSinceEpoch(), float(count))
-
-        _populate(samples_series, self.samples_series_line)
-        _populate(tests_series, self.tests_series_line)
-
-        axis_start = min(axis_datetimes) if axis_datetimes else None
-        axis_end = max(axis_datetimes) if axis_datetimes else None
-
-        if not axis_start and isinstance(start_dt, datetime):
-            axis_start = start_dt
-        if not axis_end and isinstance(end_dt, datetime):
-            axis_end = end_dt
-
-        if axis_start is None or axis_end is None:
+        if not category_labels:
             reference = datetime.now(timezone.utc)
-            qref_end = QDateTime(reference)
-            qref_start = QDateTime(reference).addDays(-1)
-            self.time_axis.setRange(qref_start, qref_end)
-            axis_end = reference
-        else:
-            self.time_axis.setRange(QDateTime(axis_start), QDateTime(axis_end))
+            category_labels = [reference.strftime('%b %d')]
+            self.samples_set.append(0.0)
+            self.tests_set.append(0.0)
+            max_value = 1
 
-        if not samples_series and axis_end:
-            qdt = QDateTime(axis_end)
-            self.samples_series_line.append(qdt.toMSecsSinceEpoch(), 0.0)
-        if not tests_series and axis_end:
-            qdt = QDateTime(axis_end)
-            self.tests_series_line.append(qdt.toMSecsSinceEpoch(), 0.0)
-
+        self.categories_axis.clear()
+        if category_labels:
+            self.categories_axis.append(category_labels)
         self.value_axis.setRange(0, max_value + 1)
 
-    def _on_series_hover(self, point, state: bool, label: str) -> None:
-        if not state:
+    def _on_bar_hover(self, status: bool, index: int, bar_set: QBarSet) -> None:
+        if not status or index < 0:
             QToolTip.hideText()
             return
-        dt = QDateTime.fromMSecsSinceEpoch(int(point.x()))
-        tooltip = f"{label}: {int(point.y())} ({dt.toString('yyyy-MM-dd')})"
-        QToolTip.showText(QCursor.pos(), tooltip, self.chart_view)
+        categories = self.categories_axis.categories() if hasattr(self.categories_axis, "categories") else []
+        if not categories or index >= len(categories):
+            QToolTip.hideText()
+            return
+        value = int(bar_set.at(index))
+        label = bar_set.label() or ""
+        category = categories[index]
+        QToolTip.showText(QCursor.pos(), f"{label}: {value} ({category})", self.chart_view)
 
     def _get_selected_range(self) -> Tuple[datetime, datetime]:
         start_qdate = self.start_date_edit.date()
