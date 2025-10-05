@@ -11,7 +11,7 @@ from PySide6.QtCharts import (
     QChartView,
     QValueAxis,
 )
-from PySide6.QtCore import QDate, QDateTime, QLocale, Qt, QThread, QObject, Signal
+from PySide6.QtCore import QDate, QDateTime, QLocale, QTimer, Qt, QThread, QObject, Signal
 from PySide6.QtGui import QBrush, QCursor, QColor, QPalette, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -118,6 +118,16 @@ class MainWindow(QMainWindow):
         self.status_label = QLabel("Listo")
         self.status_label.setAlignment(Qt.AlignCenter)
         self.status_label.setStyleSheet("color: #B0BCD5;")
+
+        self.spinner_label = QLabel("")
+        self.spinner_label.setAlignment(Qt.AlignCenter)
+        self.spinner_label.setStyleSheet("color: #7EE787; font-size: 14px;")
+        self.spinner_label.setVisible(False)
+        self._spinner_frames = ["|", "/", "-", "\\"]
+        self._spinner_index = 0
+        self._spinner_timer = QTimer(self)
+        self._spinner_timer.setInterval(100)
+        self._spinner_timer.timeout.connect(self._advance_spinner)
 
         self.start_date_edit = self._create_date_edit()
         self.end_date_edit = self._create_date_edit()
@@ -248,7 +258,15 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         layout.setSpacing(20)
         layout.addLayout(metrics_layout)
-        layout.addWidget(self.status_label)
+
+        status_layout = QHBoxLayout()
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(6)
+        status_layout.setAlignment(Qt.AlignCenter)
+        status_layout.addWidget(self.spinner_label)
+        status_layout.addWidget(self.status_label)
+        layout.addLayout(status_layout)
+
         layout.addLayout(controls_layout)
         layout.addWidget(self.chart_view)
 
@@ -386,10 +404,8 @@ class MainWindow(QMainWindow):
                 day = dt_value.date()
                 daily_counts.setdefault(day, [0, 0])[1] = int(count)
 
-        if self.samples_set.count() > 0:
-            self.samples_set.remove(0, self.samples_set.count())
-        if self.tests_set.count() > 0:
-            self.tests_set.remove(0, self.tests_set.count())
+        self.samples_set.remove(0, self.samples_set.count())
+        self.tests_set.remove(0, self.tests_set.count())
 
         sorted_days = sorted(daily_counts.keys())
         category_labels = []
@@ -409,8 +425,8 @@ class MainWindow(QMainWindow):
             max_value = 1
 
         self.categories_axis.clear()
-        if category_labels:
-            self.categories_axis.append(category_labels)
+        self.categories_axis.append(category_labels)
+        self.bar_series.setBarWidth(0.4)
         self.value_axis.setRange(0, max_value + 1)
 
     def _on_bar_hover(self, status: bool, index: int, bar_set: QBarSet) -> None:
@@ -451,6 +467,12 @@ class MainWindow(QMainWindow):
             raise ValueError("El rango de fechas no puede superar 30 dias.")
         return start_dt, end_dt
 
+    def _advance_spinner(self) -> None:
+        if not self.spinner_label.isVisible():
+            return
+        self._spinner_index = (self._spinner_index + 1) % len(self._spinner_frames)
+        self.spinner_label.setText(self._spinner_frames[self._spinner_index])
+
     @staticmethod
     def _format_tat(seconds: float, count: int) -> str:
         if count <= 0 or seconds <= 0:
@@ -470,6 +492,17 @@ class MainWindow(QMainWindow):
         self.refresh_button.setEnabled(not loading)
         self.start_date_edit.setEnabled(not loading)
         self.end_date_edit.setEnabled(not loading)
+        if loading:
+            self._spinner_index = 0
+            self.spinner_label.setText(self._spinner_frames[self._spinner_index])
+            self.spinner_label.setVisible(True)
+            if not self._spinner_timer.isActive():
+                self._spinner_timer.start()
+        else:
+            if self._spinner_timer.isActive():
+                self._spinner_timer.stop()
+            self.spinner_label.setVisible(False)
+            self.spinner_label.setText("")
 
     def _update_status(self, message: str) -> None:
         self.status_label.setText(message)
