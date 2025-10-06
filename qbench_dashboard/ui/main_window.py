@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import json
 from datetime import datetime, timezone, timedelta
-from typing import Dict, List, Optional, Tuple
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCharts import (
     QBarCategoryAxis,
@@ -15,14 +17,19 @@ from PySide6.QtCore import QDate, QDateTime, QLocale, QTimer, Qt, QThread, QObje
 from PySide6.QtGui import QBrush, QCursor, QColor, QPalette, QPainter
 from PySide6.QtWidgets import (
     QApplication,
+    QAbstractItemView,
     QCalendarWidget,
     QDateEdit,
+    QFrame,
     QGridLayout,
     QHBoxLayout,
+    QHeaderView,
     QLabel,
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QToolTip,
     QVBoxLayout,
     QWidget,
@@ -64,27 +71,104 @@ class SummaryWorker(QObject):
                 (datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc), count)
                 for day, count in sorted(counts.items())
             ]
-            sample_ids = []
+            sample_ids: List[str] = []
             seen_ids = set()
+            report_sample_ids: List[str] = []
+            report_seen = set()
             for sample in samples:
                 sid = sample.get("id")
                 if sid and sid not in seen_ids:
                     seen_ids.add(sid)
                     sample_ids.append(sid)
+                has_report = sample.get("has_report") or str(sample.get("status", "")).upper() == "REPORTED"
+                if has_report and sid and sid not in report_seen:
+                    report_seen.add(sid)
+                    report_sample_ids.append(sid)
             tests_total, tests_series, tat_sum_seconds, tat_count = self._client.count_recent_tests(
                 start_date=self._start_date,
                 end_date=self._end_date,
                 sample_ids=sample_ids,
             )
-            customers_total = self._client.count_recent_customers(
-                start_date=self._start_date,
-                end_date=self._end_date,
-            )
-            reports_total = sum(
-                1
-                for sample in samples
-                if sample.get("has_report") or str(sample.get("status", "")).upper() == "REPORTED"
-            )
+            customers_total = 0
+            customer_records: List[Dict[str, Any]] = []
+            try:
+                customer_records = self._client.fetch_recent_customers(
+                    start_date=self._start_date,
+                    end_date=self._end_date,
+                )
+            except Exception:
+                customers_total = self._client.count_recent_customers(
+                    start_date=self._start_date,
+                    end_date=self._end_date,
+                )
+            else:
+                customers_total = len(customer_records)
+            report_records: List[Dict[str, Any]] = []
+            if report_sample_ids:
+                try:
+                    report_records = self._client.fetch_reports_for_samples(report_sample_ids)
+                except Exception:
+                    report_records = []
+            customer_orders: List[Dict[str, Any]] = []
+            try:
+                customer_orders = self._client.fetch_recent_orders(
+                    start_date=self._start_date,
+                    end_date=self._end_date,
+                )
+            except Exception:
+                customer_orders = []
+            try:
+                self._export_audit_files(customer_records, report_records)
+            except Exception:
+                pass
+            reports_total = len(report_sample_ids)
+            toppers: List[Dict[str, Any]] = []
+            if customer_orders:
+                name_map = {
+                    str(item.get("id")): (item.get("name") or "")
+                    for item in customer_records
+                    if isinstance(item, dict) and item.get("id") is not None
+                }
+                aggregates: Dict[str, Dict[str, Any]] = {}
+                fallback_datetime = datetime.min.replace(tzinfo=timezone.utc)
+                for order in customer_orders:
+                    customer_id = order.get("customer_id")
+                    if not customer_id:
+                        continue
+                    entry = aggregates.get(customer_id)
+                    if entry is None:
+                        display_name = name_map.get(customer_id, "") or order.get("customer_name") or ""
+                        entry = {
+                            "id": customer_id,
+                            "name": display_name,
+                            "test_count": 0,
+                            "date_last_order": None,
+                        }
+                        aggregates[customer_id] = entry
+                    elif not entry.get("name"):
+                        entry["name"] = name_map.get(customer_id, "") or order.get("customer_name") or customer_id
+                    entry["test_count"] += int(order.get("test_count") or 0)
+                    created = order.get("date_created")
+                    if isinstance(created, datetime):
+                        last = entry.get("date_last_order")
+                        if last is None or created > last:
+                            entry["date_last_order"] = created
+                for entry in aggregates.values():
+                    if not entry.get("name"):
+                        entry["name"] = entry["id"]
+                toppers = sorted(
+                    aggregates.values(),
+                    key=lambda item: (
+                        item.get("test_count", 0),
+                        item.get("date_last_order") or fallback_datetime,
+                    ),
+                    reverse=True,
+                )
+                for entry in toppers[:10]:
+                    if not entry.get("name") or entry.get("name") == entry.get("id"):
+                        details = self._client.fetch_customer_details(entry["id"])
+                        if details and details.get("name"):
+                            entry["name"] = details.get("name") or entry["id"]
             summary = build_summary(
                 samples_total=len(samples),
                 samples_series=samples_series,
@@ -94,6 +178,9 @@ class SummaryWorker(QObject):
                 tests_tat_count=tat_count,
                 customers_total=customers_total,
                 reports_total=reports_total,
+                customers_recent=customer_records,
+                customer_test_totals=toppers,
+                reports_recent=report_records,
                 start_date=self._start_date,
                 end_date=self._end_date,
             )
@@ -101,6 +188,55 @@ class SummaryWorker(QObject):
             self.error.emit(str(exc))
         else:
             self.finished.emit(summary)
+
+    def _export_audit_files(self, customers: List[Dict[str, Any]], reports: List[Dict[str, Any]]) -> None:
+        if customers is None and reports is None:
+            return
+        try:
+            root = Path(__file__).resolve().parents[2]
+        except Exception:
+            return
+        customers_path = root / "customers_response.json"
+        reports_path = root / "reports_response.json"
+        customers_payload = [
+            {
+                "id": customer.get("id"),
+                "name": customer.get("name"),
+                "date_created": self._serialize_datetime(customer.get("date_created")),
+            }
+            for customer in (customers or [])
+        ]
+        reports_payload = [
+            {
+                "id": report.get("id"),
+                "sample_id": report.get("sample_id"),
+                "order_id": report.get("order_id"),
+                "date_generated": self._serialize_datetime(report.get("date_generated")),
+                "date_published": self._serialize_datetime(report.get("date_published")),
+                "date_emailed": self._serialize_datetime(report.get("date_emailed")),
+                "test_ids": list(report.get("test_ids") or []),
+            }
+            for report in (reports or [])
+        ]
+        self._write_json(customers_path, customers_payload)
+        self._write_json(reports_path, reports_payload)
+
+    @staticmethod
+    def _serialize_datetime(value: Optional[datetime]) -> Optional[str]:
+        if isinstance(value, datetime):
+            if value.tzinfo is None:
+                value = value.replace(tzinfo=timezone.utc)
+            else:
+                value = value.astimezone(timezone.utc)
+            return value.isoformat()
+        return None
+
+    @staticmethod
+    def _write_json(path: Path, payload: Any) -> None:
+        try:
+            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+        except OSError:
+            pass
 
 
 class MainWindow(QMainWindow):
@@ -234,7 +370,7 @@ class MainWindow(QMainWindow):
         self.reports_value = QLabel("--")
         self.reports_value.setAlignment(Qt.AlignCenter)
         self.reports_value.setStyleSheet("font-size: 26px; font-weight: 600; color: #FF8FAB;")
-        self.reports_label = QLabel("Reports")
+        self.reports_label = QLabel("Most recent reports")
         self.reports_label.setAlignment(Qt.AlignCenter)
         self.reports_label.setStyleSheet("color: #B0BCD5;")
 
@@ -269,12 +405,201 @@ class MainWindow(QMainWindow):
 
         layout.addLayout(controls_layout)
         layout.addWidget(self.chart_view)
+        self._init_bottom_lists(layout)
 
         container = QWidget()
         container.setLayout(layout)
         container.setStyleSheet("background-color: #0F172A;")
 
         self.setCentralWidget(container)
+
+    def _init_bottom_lists(self, parent_layout: QVBoxLayout) -> None:
+        lists_layout = QHBoxLayout()
+        lists_layout.setSpacing(16)
+        self.new_customers_table = self._create_table_widget(["ID", "Name", "Created"])
+        new_customers_panel = self._create_list_panel("New customers", self.new_customers_table)
+        lists_layout.addWidget(new_customers_panel, 1)
+
+        self.top_tests_table = self._create_table_widget(["ID", "Name", "Tests"])
+        top_tests_panel = self._create_list_panel("Top 10 customers with more tests", self.top_tests_table)
+        lists_layout.addWidget(top_tests_panel, 1)
+
+        self.reports_table = self._create_table_widget(["ID", "Sample", "Tests", "Generated"])
+        reports_panel = self._create_list_panel("Most recent reports", self.reports_table)
+        lists_layout.addWidget(reports_panel, 1)
+        parent_layout.addLayout(lists_layout)
+
+    def _create_table_widget(self, headers: List[str]) -> QTableWidget:
+        table = QTableWidget()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        header = table.horizontalHeader()
+        header.setStretchLastSection(False)
+        for index in range(table.columnCount()):
+            if index == 0:
+                mode = QHeaderView.ResizeToContents
+            elif index == table.columnCount() - 1:
+                mode = QHeaderView.ResizeToContents
+            else:
+                mode = QHeaderView.Stretch
+            header.setSectionResizeMode(index, mode)
+        header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header.setSectionsClickable(False)
+        header.setHighlightSections(False)
+        table.verticalHeader().setVisible(False)
+        table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        table.setSelectionMode(QAbstractItemView.NoSelection)
+        table.setFocusPolicy(Qt.NoFocus)
+        table.setAlternatingRowColors(True)
+        table.setStyleSheet("QTableWidget { background-color: #0F172A; alternate-background-color: #17233D; color: #E0E8FF; }")
+        table.setMinimumHeight(200)
+        return table
+
+    def _create_list_panel(self, title: str, content_widget: QWidget) -> QFrame:
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setStyleSheet("QFrame { background-color: #111C34; border: 1px solid #1F3B73; border-radius: 10px; }")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+        title_label = QLabel(title)
+        title_label.setStyleSheet("color: #E0E8FF; font-weight: 600; font-size: 14px;")
+        layout.addWidget(title_label)
+        layout.addWidget(content_widget)
+        return frame
+
+    def _create_placeholder_panel(self, title: str) -> QFrame:
+        label = QLabel("Coming soon")
+        label.setAlignment(Qt.AlignCenter)
+        label.setWordWrap(True)
+        label.setStyleSheet("color: #5F718F; font-size: 13px;")
+        return self._create_list_panel(title, label)
+
+    def _update_top_tests(self, records: List[Dict[str, Any]]) -> None:
+        table = self.top_tests_table
+        table.clearContents()
+        table.setRowCount(0)
+        data = list(records or [])[:10]
+        if not data:
+            table.setRowCount(1)
+            table.setSpan(0, 0, 1, table.columnCount())
+            item = QTableWidgetItem("No data")
+            item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(0, 0, item)
+            return
+        table.setRowCount(len(data))
+        for row, record in enumerate(data):
+            identifier = record.get("id")
+            name = record.get("name") or ""
+            test_count = int(record.get("test_count") or 0)
+            id_item = QTableWidgetItem(str(identifier) if identifier is not None else "")
+            name_item = QTableWidgetItem(str(name))
+            tests_item = QTableWidgetItem(str(test_count))
+            id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            tests_item.setFlags(tests_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 0, id_item)
+            table.setItem(row, 1, name_item)
+            table.setItem(row, 2, tests_item)
+        table.resizeRowsToContents()
+
+    def _update_reports_table(self, reports: List[Dict[str, Any]]) -> None:
+        table = self.reports_table
+        table.clearContents()
+        table.setRowCount(0)
+        fallback = datetime.min.replace(tzinfo=timezone.utc)
+        records = list(reports or [])
+
+        def sort_key(item: Dict[str, Any]) -> datetime:
+            value = item.get("date_generated") if isinstance(item, dict) else None
+            if isinstance(value, datetime):
+                return value
+            return fallback
+
+        records.sort(key=sort_key, reverse=True)
+        records = records[:10]
+        if not records:
+            table.setRowCount(1)
+            table.setSpan(0, 0, 1, table.columnCount())
+            item = QTableWidgetItem("No reports")
+            item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(0, 0, item)
+            return
+
+        table.setRowCount(len(records))
+        for row, record in enumerate(records):
+            identifier = record.get("id")
+            sample = record.get("sample_id") or ""
+            tests = record.get("test_ids")
+            if isinstance(tests, (list, tuple)):
+                tests_text = ", ".join(str(value) for value in tests if value not in (None, ""))
+            elif tests is None:
+                tests_text = ""
+            else:
+                tests_text = str(tests)
+            generated = self._format_timestamp(record.get("date_generated"))
+
+            id_item = QTableWidgetItem(str(identifier) if identifier is not None else "")
+            sample_item = QTableWidgetItem(str(sample))
+            tests_item = QTableWidgetItem(tests_text)
+            generated_item = QTableWidgetItem(generated)
+
+            for item_widget in (id_item, sample_item, tests_item, generated_item):
+                item_widget.setFlags(item_widget.flags() & ~Qt.ItemIsEditable)
+
+            table.setItem(row, 0, id_item)
+            table.setItem(row, 1, sample_item)
+            table.setItem(row, 2, tests_item)
+            table.setItem(row, 3, generated_item)
+        table.resizeRowsToContents()
+
+    def _update_new_customers(self, customers: List[Dict[str, Any]]) -> None:
+        table = self.new_customers_table
+        table.clearContents()
+        table.setRowCount(0)
+        fallback = datetime.min.replace(tzinfo=timezone.utc)
+        records = list(customers or [])
+
+        def sort_key(item: Dict[str, Any]) -> datetime:
+            value = item.get("date_created") if isinstance(item, dict) else None
+            if isinstance(value, datetime):
+                return value
+            return fallback
+
+        records.sort(key=sort_key, reverse=True)
+        records = records[:10]
+        if not records:
+            table.setRowCount(1)
+            table.setSpan(0, 0, 1, table.columnCount())
+            item = QTableWidgetItem("No recent customers")
+            item.setTextAlignment(Qt.AlignCenter)
+            table.setItem(0, 0, item)
+            return
+        table.setRowCount(len(records))
+        for row, record in enumerate(records):
+            identifier = record.get("id")
+            name = record.get("name") or ""
+            created = self._format_timestamp(record.get("date_created"))
+            id_item = QTableWidgetItem(str(identifier) if identifier is not None else "")
+            name_item = QTableWidgetItem(str(name))
+            created_item = QTableWidgetItem(created)
+            id_item.setFlags(id_item.flags() & ~Qt.ItemIsEditable)
+            name_item.setFlags(name_item.flags() & ~Qt.ItemIsEditable)
+            created_item.setFlags(created_item.flags() & ~Qt.ItemIsEditable)
+            table.setItem(row, 0, id_item)
+            table.setItem(row, 1, name_item)
+            table.setItem(row, 2, created_item)
+        table.resizeRowsToContents()
+
+    @staticmethod
+    def _format_timestamp(value: Any) -> str:
+        if isinstance(value, datetime):
+            dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            dt = dt.astimezone(timezone.utc)
+            return dt.strftime('%Y-%m-%d %H:%M')
+        if isinstance(value, str):
+            return value
+        return ''
 
     def _apply_dark_palette(self) -> None:
         palette = QPalette()
@@ -384,6 +709,24 @@ class MainWindow(QMainWindow):
 
         start_dt = summary.get("start_date")
         end_dt = summary.get("end_date")
+        customers_recent = summary.get("customers_recent")
+        if isinstance(customers_recent, list):
+            self._update_new_customers(customers_recent)
+        else:
+            self._update_new_customers([])
+
+        tests_leaderboard = summary.get("customer_test_totals")
+        if isinstance(tests_leaderboard, list):
+            self._update_top_tests(tests_leaderboard)
+        else:
+            self._update_top_tests([])
+
+        reports_recent = summary.get("reports_recent")
+        if isinstance(reports_recent, list):
+            self._update_reports_table(reports_recent)
+        else:
+            self._update_reports_table([])
+
         range_text = self._format_range(start_dt, end_dt)
         now = datetime.now(timezone.utc)
         status_parts = [f"Last update: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"]

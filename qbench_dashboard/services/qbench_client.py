@@ -1,4 +1,5 @@
 import time
+import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -18,6 +19,7 @@ class QBenchClient:
         self._token_exp = 0.0
         self._token = ""
         self.session = requests.Session()
+        self._customer_cache: Dict[str, Dict[str, Any]] = {}
 
     def _is_token_expired(self) -> bool:
         return not self._token or time.time() >= self._token_exp
@@ -366,6 +368,205 @@ class QBenchClient:
 
         return total
 
+    def fetch_recent_customers(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        page_size: int = 50,
+        max_days: int = 30,
+        default_days: int = 7,
+    ) -> List[Dict[str, Any]]:
+        """Fetch customers created within the given date range."""
+        now = datetime.now(timezone.utc)
+
+        def _normalize(value: Optional[Union[datetime, date]], *, pad_end: bool) -> Optional[datetime]:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                dt = value
+            elif isinstance(value, date):
+                time_part = datetime.max.time() if pad_end else datetime.min.time()
+                dt = datetime.combine(value, time_part)
+            else:
+                raise TypeError(f"Unsupported date value: {type(value)!r}")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt
+
+        end_dt = _normalize(end_date, pad_end=True) or now
+        lookback_days = max(1, min(default_days, max_days))
+        start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=lookback_days)
+
+        if end_dt < start_dt:
+            raise ValueError("Start date must be before or equal to end date.")
+        if end_dt - start_dt > timedelta(days=max_days):
+            raise ValueError(f"Date range cannot exceed {max_days} days.")
+
+        customers: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            params = {
+                "page_num": page,
+                "page_size": page_size,
+                "sort_by": "date_created",
+                "sort_order": "desc",
+            }
+            payload = self._request(self.session.get, "customer", params=params)
+            data = payload.get("data")
+            if not data:
+                break
+            if isinstance(data, dict):
+                items = [data]
+            else:
+                items = list(data)
+            if not items:
+                break
+
+            stop = False
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                created = self._parse_date(item.get("date_created"))
+                if not isinstance(created, datetime):
+                    continue
+                if created > end_dt:
+                    continue
+                if created < start_dt:
+                    stop = True
+                    break
+                normalized = self._normalize_customer(item, created)
+                if normalized:
+                    customers.append(normalized)
+
+            if stop or len(items) < page_size:
+                break
+            page += 1
+
+        return customers
+
+    def fetch_reports_for_samples(
+        self,
+        sample_ids: Sequence[Union[str, int]],
+    ) -> List[Dict[str, Any]]:
+        """Fetch report metadata for the provided sample IDs."""
+        reports: List[Dict[str, Any]] = []
+        for sample_id in sample_ids:
+            sample_key = str(sample_id).strip()
+            if not sample_key:
+                continue
+            try:
+                payload = self._request(self.session.get, f"report/sample/{sample_key}/info")
+            except QBenchError:
+                continue
+            normalized = self._normalize_report(payload, sample_key)
+            if normalized:
+                reports.append(normalized)
+        return reports
+
+    def fetch_recent_orders(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        page_size: int = 50,
+        max_days: int = 30,
+        default_days: int = 7,
+    ) -> List[Dict[str, Any]]:
+        """Fetch orders within a given date range."""
+        now = datetime.now(timezone.utc)
+
+        def _normalize(value: Optional[Union[datetime, date]], *, pad_end: bool) -> Optional[datetime]:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                dt = value
+            elif isinstance(value, date):
+                time_part = datetime.max.time() if pad_end else datetime.min.time()
+                dt = datetime.combine(value, time_part)
+            else:
+                raise TypeError(f"Unsupported date value: {type(value)!r}")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt
+
+        end_dt = _normalize(end_date, pad_end=True) or now
+        lookback_days = max(1, min(default_days, max_days))
+        start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=lookback_days)
+
+        if end_dt < start_dt:
+            raise ValueError("Start date must be before or equal to end date.")
+        if end_dt - start_dt > timedelta(days=max_days):
+            raise ValueError(f"Date range cannot exceed {max_days} days.")
+
+        orders: List[Dict[str, Any]] = []
+        page = 1
+        while True:
+            params = {
+                "page_num": page,
+                "page_size": page_size,
+                "sort_by": "date_created",
+                "sort_order": "desc",
+            }
+            payload = self._request(self.session.get, "order", params=params)
+            data = payload.get("data")
+            if not data:
+                break
+            if isinstance(data, dict):
+                items = [data]
+            else:
+                items = list(data)
+            if not items:
+                break
+
+            stop = False
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                created = self._parse_date(item.get("date_created"))
+                if not isinstance(created, datetime):
+                    continue
+                if created > end_dt:
+                    continue
+                if created < start_dt:
+                    stop = True
+                    break
+                normalized = self._normalize_order(item, created)
+                if normalized:
+                    orders.append(normalized)
+
+            if stop or len(items) < page_size:
+                break
+            page += 1
+
+        return orders
+
+    def fetch_customer_details(self, customer_id: Union[str, int]) -> Optional[Dict[str, Any]]:
+        key = str(customer_id).strip()
+        if not key:
+            return None
+        cached = self._customer_cache.get(key)
+        if cached is not None:
+            return cached
+        try:
+            payload = self._request(self.session.get, f"customer/{key}")
+        except QBenchError:
+            return None
+        if not isinstance(payload, dict):
+            return None
+        name = payload.get("customer_name") or payload.get("name") or ""
+        record = {
+            "id": key,
+            "name": name,
+            "date_created": self._parse_date(payload.get("date_created")),
+        }
+        self._customer_cache[key] = record
+        return record
+
     def _extract_samples(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         data = payload.get("data")
         if not data:
@@ -381,6 +582,83 @@ class QBenchClient:
             if sample:
                 normalized.append(sample)
         return normalized
+
+    def _normalize_order(self, raw: Any, created: Optional[datetime]) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        customer_id = raw.get("customer_account_id")
+        customer_name = raw.get("customer_name") or raw.get("customer") or ""
+        if isinstance(customer_name, dict):
+            customer_name = (
+                customer_name.get("name")
+                or customer_name.get("customer_name")
+                or ""
+            )
+        test_count = raw.get("test_count")
+        order_id = raw.get("id")
+        date_received = self._parse_date(raw.get("date_received"))
+        return {
+            "id": str(order_id) if order_id is not None else "",
+            "customer_id": str(customer_id) if customer_id is not None else "",
+            "customer_name": customer_name or "",
+            "test_count": int(test_count or 0),
+            "date_created": created,
+            "date_received": date_received,
+        }
+
+    def _normalize_customer(self, raw: Any, created: Optional[datetime]) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        customer_id = raw.get("id")
+        name = raw.get("customer_name") or raw.get("name") or ""
+        return {
+            "id": str(customer_id) if customer_id is not None else "",
+            "name": name,
+            "date_created": created,
+        }
+
+    def _normalize_report(self, payload: Any, sample_id: str) -> Optional[Dict[str, Any]]:
+        if not isinstance(payload, dict):
+            return None
+        report_id = payload.get("id")
+        if report_id is None:
+            return None
+        date_generated = self._parse_date(payload.get("date_generated"))
+        date_published = self._parse_date(payload.get("date_published"))
+        date_emailed = self._parse_date(payload.get("date_emailed"))
+        order_id = payload.get("order_id")
+        test_ids: List[str] = []
+        raw_params = payload.get("render_params")
+        if isinstance(raw_params, str) and raw_params:
+            try:
+                params_obj = json.loads(raw_params)
+            except json.JSONDecodeError:
+                params_obj = None
+            if isinstance(params_obj, dict):
+                raw_tests = params_obj.get("test_ids")
+                if isinstance(raw_tests, list):
+                    for value in raw_tests:
+                        if value is None:
+                            continue
+                        test_ids.append(str(value))
+        if not test_ids:
+            raw_tests = payload.get("test_ids")
+            if isinstance(raw_tests, list):
+                for value in raw_tests:
+                    if value is None:
+                        continue
+                    test_ids.append(str(value))
+            elif raw_tests is not None:
+                test_ids.append(str(raw_tests))
+        return {
+            "id": str(report_id),
+            "sample_id": sample_id,
+            "order_id": str(order_id) if order_id not in (None, "") else None,
+            "date_generated": date_generated,
+            "date_published": date_published,
+            "date_emailed": date_emailed,
+            "test_ids": test_ids,
+        }
 
     def _normalize_sample(self, raw: Any) -> Optional[Dict[str, Any]]:
         if not isinstance(raw, dict):
