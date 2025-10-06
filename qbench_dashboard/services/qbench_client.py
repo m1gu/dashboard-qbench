@@ -177,7 +177,7 @@ class QBenchClient:
         default_days: int = 7,
         sample_ids: Optional[Sequence[Union[str, int]]] = None,
         chunk_size: int = 40,
-    ) -> Tuple[int, List[Tuple[datetime, int]], float, int]:
+    ) -> Tuple[int, List[Tuple[datetime, int]], float, int, List[Tuple[datetime, float, int]]]:
         """Collect tests created within a date range and return totals and series."""
         now = datetime.now(timezone.utc)
 
@@ -212,6 +212,8 @@ class QBenchClient:
         total = 0
         sum_seconds = 0.0
         duration_count = 0
+        tat_seconds_by_day: Dict[date, float] = {}
+        tat_counts_by_day: Dict[date, int] = {}
 
         def _process_page(items: List[Dict[str, Any]]) -> bool:
             nonlocal total, sum_seconds, duration_count
@@ -236,6 +238,9 @@ class QBenchClient:
                     if delta > 0:
                         sum_seconds += delta
                         duration_count += 1
+                        day = created.date()
+                        tat_seconds_by_day[day] = tat_seconds_by_day.get(day, 0.0) + float(delta)
+                        tat_counts_by_day[day] = tat_counts_by_day.get(day, 0) + 1
             return stop
 
         def _iterate(params: Dict[str, Any]) -> None:
@@ -289,7 +294,19 @@ class QBenchClient:
             (datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc), count)
             for day, count in sorted(counter.items())
         ]
-        return total, series, sum_seconds, duration_count
+        tat_daily = []
+        for day in sorted(tat_seconds_by_day.keys()):
+            seconds_total = tat_seconds_by_day.get(day, 0.0)
+            count_value = tat_counts_by_day.get(day, 0)
+            average = seconds_total / count_value if count_value > 0 else 0.0
+            tat_daily.append(
+                (
+                    datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc),
+                    average,
+                    int(count_value),
+                )
+            )
+        return total, series, sum_seconds, duration_count, tat_daily
 
     def count_recent_customers(
         self,
@@ -465,6 +482,36 @@ class QBenchClient:
             if normalized:
                 reports.append(normalized)
         return reports
+
+    def fetch_sample_tests(
+        self,
+        sample_ids: Sequence[Union[str, int]],
+    ) -> Dict[str, Dict[str, Dict[str, str]]]:
+        """Fetch tests (including label abbreviations) for the provided sample IDs."""
+        results: Dict[str, Dict[str, Dict[str, str]]] = {}
+        unique_ids: List[str] = []
+        seen: set[str] = set()
+        for sample_id in sample_ids:
+            key = str(sample_id).strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique_ids.append(key)
+
+        for sample_key in unique_ids:
+            try:
+                payload = self._request(
+                    self.session.get,
+                    f"sample/{sample_key}",
+                    params={"include": "tests"},
+                )
+            except QBenchError:
+                continue
+            tests = self._extract_tests_from_sample(payload)
+            if tests:
+                results[sample_key] = tests
+        return results
+
 
     def fetch_recent_orders(
         self,
@@ -658,6 +705,43 @@ class QBenchClient:
             "date_published": date_published,
             "date_emailed": date_emailed,
             "test_ids": test_ids,
+        }
+
+    def _extract_tests_from_sample(self, payload: Any) -> Dict[str, Dict[str, str]]:
+        tests: Dict[str, Dict[str, str]] = {}
+
+        def _collect(node: Any) -> None:
+            if isinstance(node, dict):
+                for key, value in node.items():
+                    if key == "tests" and isinstance(value, list):
+                        for item in value:
+                            normalized = self._normalize_test(item)
+                            if not normalized:
+                                continue
+                            test_id = normalized.get("id")
+                            if test_id:
+                                tests[test_id] = normalized
+                    else:
+                        _collect(value)
+            elif isinstance(node, list):
+                for item in node:
+                    _collect(item)
+
+        _collect(payload)
+        return tests
+
+    def _normalize_test(self, raw: Any) -> Optional[Dict[str, Any]]:
+        if not isinstance(raw, dict):
+            return None
+        test_id = raw.get("id") or raw.get("test_id")
+        if test_id is None:
+            return None
+        title = raw.get("title") or raw.get("name") or raw.get("test_name") or ""
+        label = raw.get("label_abbr") or raw.get("label_abbreviation") or raw.get("abbr") or ""
+        return {
+            "id": str(test_id),
+            "title": str(title) if title not in (None, "") else "",
+            "label_abbr": str(label) if label not in (None, "") else "",
         }
 
     def _normalize_sample(self, raw: Any) -> Optional[Dict[str, Any]]:

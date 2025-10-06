@@ -12,11 +12,12 @@ def build_summary(
     tests_series: Optional[Series] = None,
     tests_tat_sum: float = 0.0,
     tests_tat_count: int = 0,
+    tests_tat_daily: Optional[Sequence[Tuple[datetime, float, int]]] = None,
+    tests_tat_daily_previous: Optional[Sequence[Tuple[datetime, float, int]]] = None,
     customers_total: int = 0,
     reports_total: int = 0,
     customers_recent: Optional[Sequence[Dict[str, object]]] = None,
     customer_test_totals: Optional[Sequence[Dict[str, object]]] = None,
-    reports_recent: Optional[Sequence[Dict[str, object]]] = None,
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
 ) -> Dict[str, object]:
@@ -71,25 +72,28 @@ def build_summary(
                 "date_last_order": _as_utc(created_dt),
             })
 
-    reports_payload = []
-    if reports_recent:
-        for item in reports_recent[:20]:
-            if not isinstance(item, dict):
+    tat_daily_payload = []
+    if tests_tat_daily:
+        for dt_value, average_seconds, count_value in tests_tat_daily:
+            if not isinstance(dt_value, datetime):
                 continue
-            generated = item.get("date_generated")
-            generated_dt = generated if isinstance(generated, datetime) else None
-            tests = item.get("test_ids")
-            if isinstance(tests, (list, tuple)):
-                tests_list = [str(value) for value in tests if value is not None]
-            elif tests is None:
-                tests_list = []
-            else:
-                tests_list = [str(tests)]
-            reports_payload.append({
-                "id": item.get("id"),
-                "sample_id": item.get("sample_id"),
-                "test_ids": tests_list,
-                "date_generated": _as_utc(generated_dt),
+            normalized_dt = dt_value if dt_value.tzinfo else dt_value.replace(tzinfo=timezone.utc)
+            tat_daily_payload.append({
+                "date": normalized_dt,
+                "average_seconds": float(average_seconds),
+                "test_count": int(count_value),
+            })
+
+    tat_previous_payload = []
+    if tests_tat_daily_previous:
+        for dt_value, average_seconds, count_value in tests_tat_daily_previous:
+            if not isinstance(dt_value, datetime):
+                continue
+            normalized_dt = dt_value if dt_value.tzinfo else dt_value.replace(tzinfo=timezone.utc)
+            tat_previous_payload.append({
+                "date": normalized_dt,
+                "average_seconds": float(average_seconds),
+                "test_count": int(count_value),
             })
 
     return {
@@ -99,11 +103,12 @@ def build_summary(
         "tests_series": normalized_tests,
         "tests_tat_average_seconds": tat_average_seconds,
         "tests_tat_count": max(0, int(tests_tat_count)),
+        "tests_tat_daily": tat_daily_payload,
+        "tests_tat_daily_previous": tat_previous_payload,
         "customers_total": max(0, int(customers_total)),
         "reports_total": max(0, int(reports_total)),
         "customers_recent": customers_payload,
         "customer_test_totals": tests_leaderboard,
-        "reports_recent": reports_payload,
         "start_date": _as_utc(start_date),
         "end_date": _as_utc(end_date),
     }

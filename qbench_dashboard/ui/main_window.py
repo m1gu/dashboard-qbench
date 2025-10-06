@@ -1,24 +1,26 @@
 from __future__ import annotations
 
-import json
 from datetime import datetime, timezone, timedelta
-from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
 from PySide6.QtCharts import (
+    QAreaSeries,
     QBarCategoryAxis,
     QBarSeries,
     QBarSet,
     QChart,
     QChartView,
+    QDateTimeAxis,
+    QLineSeries,
     QValueAxis,
 )
 from PySide6.QtCore import QDate, QDateTime, QLocale, QTimer, Qt, QThread, QObject, Signal
-from PySide6.QtGui import QBrush, QCursor, QColor, QPalette, QPainter
+from PySide6.QtGui import QBrush, QCursor, QColor, QGradient, QLinearGradient, QPalette, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QCalendarWidget,
+    QCheckBox,
     QDateEdit,
     QFrame,
     QGridLayout,
@@ -84,11 +86,33 @@ class SummaryWorker(QObject):
                 if has_report and sid and sid not in report_seen:
                     report_seen.add(sid)
                     report_sample_ids.append(sid)
-            tests_total, tests_series, tat_sum_seconds, tat_count = self._client.count_recent_tests(
+            tests_total, tests_series, tat_sum_seconds, tat_count, tat_daily = self._client.count_recent_tests(
                 start_date=self._start_date,
                 end_date=self._end_date,
                 sample_ids=sample_ids,
             )
+            tat_previous_daily: List[Tuple[datetime, float, int]] = []
+            range_start = self._start_date
+            range_end = self._end_date
+            now_utc = datetime.now(timezone.utc)
+            if range_end is None:
+                range_end = now_utc
+            if range_start is None:
+                range_start = range_end - timedelta(days=6)
+            if range_end < range_start:
+                range_start, range_end = range_end, range_start
+            period_delta = range_end - range_start
+            if period_delta.total_seconds() > 0:
+                previous_end = range_start - timedelta(microseconds=1)
+                previous_start = previous_end - period_delta
+                try:
+                    _, _, _, _, tat_previous_daily = self._client.count_recent_tests(
+                        start_date=previous_start,
+                        end_date=previous_end,
+                        sample_ids=None,
+                    )
+                except Exception:
+                    tat_previous_daily = []
             customers_total = 0
             customer_records: List[Dict[str, Any]] = []
             try:
@@ -103,12 +127,6 @@ class SummaryWorker(QObject):
                 )
             else:
                 customers_total = len(customer_records)
-            report_records: List[Dict[str, Any]] = []
-            if report_sample_ids:
-                try:
-                    report_records = self._client.fetch_reports_for_samples(report_sample_ids)
-                except Exception:
-                    report_records = []
             customer_orders: List[Dict[str, Any]] = []
             try:
                 customer_orders = self._client.fetch_recent_orders(
@@ -117,10 +135,6 @@ class SummaryWorker(QObject):
                 )
             except Exception:
                 customer_orders = []
-            try:
-                self._export_audit_files(customer_records, report_records)
-            except Exception:
-                pass
             reports_total = len(report_sample_ids)
             toppers: List[Dict[str, Any]] = []
             if customer_orders:
@@ -176,11 +190,12 @@ class SummaryWorker(QObject):
                 tests_series=tests_series,
                 tests_tat_sum=tat_sum_seconds,
                 tests_tat_count=tat_count,
+                tests_tat_daily=tat_daily,
+                tests_tat_daily_previous=tat_previous_daily,
                 customers_total=customers_total,
                 reports_total=reports_total,
                 customers_recent=customer_records,
                 customer_test_totals=toppers,
-                reports_recent=report_records,
                 start_date=self._start_date,
                 end_date=self._end_date,
             )
@@ -188,55 +203,6 @@ class SummaryWorker(QObject):
             self.error.emit(str(exc))
         else:
             self.finished.emit(summary)
-
-    def _export_audit_files(self, customers: List[Dict[str, Any]], reports: List[Dict[str, Any]]) -> None:
-        if customers is None and reports is None:
-            return
-        try:
-            root = Path(__file__).resolve().parents[2]
-        except Exception:
-            return
-        customers_path = root / "customers_response.json"
-        reports_path = root / "reports_response.json"
-        customers_payload = [
-            {
-                "id": customer.get("id"),
-                "name": customer.get("name"),
-                "date_created": self._serialize_datetime(customer.get("date_created")),
-            }
-            for customer in (customers or [])
-        ]
-        reports_payload = [
-            {
-                "id": report.get("id"),
-                "sample_id": report.get("sample_id"),
-                "order_id": report.get("order_id"),
-                "date_generated": self._serialize_datetime(report.get("date_generated")),
-                "date_published": self._serialize_datetime(report.get("date_published")),
-                "date_emailed": self._serialize_datetime(report.get("date_emailed")),
-                "test_ids": list(report.get("test_ids") or []),
-            }
-            for report in (reports or [])
-        ]
-        self._write_json(customers_path, customers_payload)
-        self._write_json(reports_path, reports_payload)
-
-    @staticmethod
-    def _serialize_datetime(value: Optional[datetime]) -> Optional[str]:
-        if isinstance(value, datetime):
-            if value.tzinfo is None:
-                value = value.replace(tzinfo=timezone.utc)
-            else:
-                value = value.astimezone(timezone.utc)
-            return value.isoformat()
-        return None
-
-    @staticmethod
-    def _write_json(path: Path, payload: Any) -> None:
-        try:
-            path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
-        except OSError:
-            pass
 
 
 class MainWindow(QMainWindow):
@@ -246,6 +212,9 @@ class MainWindow(QMainWindow):
         self._thread: Optional[QThread] = None
         self._worker: Optional[SummaryWorker] = None
         self._loading = False
+        self._tat_target_seconds = 48 * 3600  # 48-hour SLA target by default
+        self._tat_moving_average_window = 7
+        self._tat_tooltip_data: Dict[int, Tuple[datetime, float, int]] = {}
 
         self.setWindowTitle("QBench Dashboard")
         self.resize(1280, 720)
@@ -370,7 +339,7 @@ class MainWindow(QMainWindow):
         self.reports_value = QLabel("--")
         self.reports_value.setAlignment(Qt.AlignCenter)
         self.reports_value.setStyleSheet("font-size: 26px; font-weight: 600; color: #FF8FAB;")
-        self.reports_label = QLabel("Most recent reports")
+        self.reports_label = QLabel("Reports")
         self.reports_label.setAlignment(Qt.AlignCenter)
         self.reports_label.setStyleSheet("color: #B0BCD5;")
 
@@ -424,9 +393,8 @@ class MainWindow(QMainWindow):
         top_tests_panel = self._create_list_panel("Top 10 customers with more tests", self.top_tests_table)
         lists_layout.addWidget(top_tests_panel, 1)
 
-        self.reports_table = self._create_table_widget(["ID", "Sample", "Tests", "Generated"])
-        reports_panel = self._create_list_panel("Most recent reports", self.reports_table)
-        lists_layout.addWidget(reports_panel, 1)
+        tat_panel = self._create_tat_panel()
+        lists_layout.addWidget(tat_panel, 1)
         parent_layout.addLayout(lists_layout)
 
     def _create_table_widget(self, headers: List[str]) -> QTableWidget:
@@ -468,12 +436,281 @@ class MainWindow(QMainWindow):
         layout.addWidget(content_widget)
         return frame
 
+    def _create_tat_panel(self) -> QFrame:
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setStyleSheet("QFrame { background-color: #111C34; border: 1px solid #1F3B73; border-radius: 10px; }")
+
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title_label = QLabel("Daily TAT trend")
+        title_label.setStyleSheet("color: #E0E8FF; font-weight: 600; font-size: 14px;")
+        layout.addWidget(title_label)
+
+        self.tat_chart = QChart()
+        self.tat_chart.setBackgroundBrush(Qt.transparent)
+        tat_legend = self.tat_chart.legend()
+        tat_legend.setVisible(True)
+        tat_legend.setLabelBrush(QBrush(Qt.white))
+        tat_legend.setBackgroundVisible(False)
+
+        self.tat_zero_series = QLineSeries()
+        self.tat_zero_series.setName("")
+        self.tat_zero_series.setVisible(False)
+
+        self.tat_under_series = QLineSeries()
+        self.tat_under_series.setName("")
+        self.tat_under_series.setVisible(False)
+
+        self.tat_line_series = QLineSeries()
+        self.tat_line_series.setName("Daily avg")
+        tat_pen = QPen(QColor("#60CDF1"))
+        tat_pen.setWidth(2)
+        self.tat_line_series.setPen(tat_pen)
+        self.tat_line_series.hovered.connect(self._on_tat_point_hover)
+
+        self.tat_threshold_series = QLineSeries()
+        self.tat_threshold_series.setName("Target")
+        threshold_pen = QPen(QColor("#FFB347"))
+        threshold_pen.setWidth(2)
+        threshold_pen.setStyle(Qt.DashLine)
+        self.tat_threshold_series.setPen(threshold_pen)
+
+        self.tat_over_series = QLineSeries()
+        self.tat_over_series.setName("")
+        self.tat_over_series.setVisible(False)
+
+        self.tat_moving_avg_series = QLineSeries()
+        self.tat_moving_avg_series.setName("7d moving avg")
+        moving_pen = QPen(QColor("#9A7FF0"))
+        moving_pen.setWidth(2)
+        moving_pen.setStyle(Qt.DashDotLine)
+        self.tat_moving_avg_series.setPen(moving_pen)
+
+        self.tat_previous_series = QLineSeries()
+        self.tat_previous_series.setName("Previous period")
+        previous_pen = QPen(QColor("#FF8FAB"))
+        previous_pen.setWidth(2)
+        previous_pen.setStyle(Qt.DotLine)
+        self.tat_previous_series.setPen(previous_pen)
+        self.tat_previous_series.setVisible(False)
+
+        self.tat_under_area = QAreaSeries(self.tat_under_series, self.tat_zero_series)
+        self.tat_under_area.setName("Within target")
+        under_gradient = QLinearGradient(0.0, 0.0, 0.0, 1.0)
+        under_gradient.setCoordinateMode(QGradient.ObjectBoundingMode)
+        under_gradient.setColorAt(0.0, QColor(0x4C, 0xAF, 0x50, 180))
+        under_gradient.setColorAt(1.0, QColor(0x4C, 0xAF, 0x50, 40))
+        self.tat_under_area.setBrush(QBrush(under_gradient))
+        self.tat_under_area.setPen(QPen(QColor(0x4C, 0xAF, 0x50, 160)))
+
+        self.tat_over_area = QAreaSeries(self.tat_over_series, self.tat_threshold_series)
+        self.tat_over_area.setName("Above target")
+        over_gradient = QLinearGradient(0.0, 0.0, 0.0, 1.0)
+        over_gradient.setCoordinateMode(QGradient.ObjectBoundingMode)
+        over_gradient.setColorAt(0.0, QColor(0xE5, 0x73, 0x73, 200))
+        over_gradient.setColorAt(1.0, QColor(0xE5, 0x73, 0x73, 60))
+        self.tat_over_area.setBrush(QBrush(over_gradient))
+        self.tat_over_area.setPen(QPen(QColor(0xE5, 0x73, 0x73, 180)))
+
+        self.tat_axis_x = QDateTimeAxis()
+        self.tat_axis_x.setFormat("MMM dd")
+        self.tat_axis_x.setLabelsColor(Qt.white)
+        self.tat_axis_x.setTitleText("Date")
+        self.tat_axis_x.setTitleBrush(Qt.white)
+
+        self.tat_axis_y = QValueAxis()
+        self.tat_axis_y.setLabelFormat("%.1f")
+        self.tat_axis_y.setLabelsColor(Qt.white)
+        self.tat_axis_y.setTitleText("Hours")
+        self.tat_axis_y.setTitleBrush(Qt.white)
+
+        self.tat_chart.addSeries(self.tat_under_area)
+        self.tat_chart.addSeries(self.tat_over_area)
+        self.tat_chart.addSeries(self.tat_line_series)
+        self.tat_chart.addSeries(self.tat_moving_avg_series)
+        self.tat_chart.addSeries(self.tat_threshold_series)
+        self.tat_chart.addSeries(self.tat_previous_series)
+
+        self.tat_chart.addAxis(self.tat_axis_x, Qt.AlignBottom)
+        self.tat_chart.addAxis(self.tat_axis_y, Qt.AlignLeft)
+        for series in (
+            self.tat_under_area,
+            self.tat_over_area,
+            self.tat_line_series,
+            self.tat_moving_avg_series,
+            self.tat_threshold_series,
+            self.tat_previous_series,
+        ):
+            series.attachAxis(self.tat_axis_x)
+            series.attachAxis(self.tat_axis_y)
+
+        self.tat_chart_view = QChartView(self.tat_chart)
+        self.tat_chart_view.setRenderHint(QPainter.Antialiasing, True)
+        self.tat_chart_view.setMinimumHeight(300)
+        self.tat_chart_view.setStyleSheet("background: rgba(32, 40, 62, 0.6);")
+        layout.addWidget(self.tat_chart_view)
+
+        controls_layout = QHBoxLayout()
+        controls_layout.setContentsMargins(0, 0, 0, 0)
+        controls_layout.addStretch()
+        self.tat_compare_checkbox = QCheckBox("Show previous period")
+        self.tat_compare_checkbox.setStyleSheet("color: #B0BCD5;")
+        self.tat_compare_checkbox.setEnabled(False)
+        self.tat_compare_checkbox.toggled.connect(self._on_tat_compare_toggled)
+        controls_layout.addWidget(self.tat_compare_checkbox)
+        layout.addLayout(controls_layout)
+
+        return frame
+
     def _create_placeholder_panel(self, title: str) -> QFrame:
         label = QLabel("Coming soon")
         label.setAlignment(Qt.AlignCenter)
         label.setWordWrap(True)
         label.setStyleSheet("color: #5F718F; font-size: 13px;")
         return self._create_list_panel(title, label)
+
+    def _on_tat_compare_toggled(self, checked: bool) -> None:
+        if not hasattr(self, "tat_previous_series"):
+            return
+        has_points = self.tat_previous_series and self.tat_previous_series.count() > 0
+        self.tat_previous_series.setVisible(bool(checked and has_points))
+
+    def _on_tat_point_hover(self, point, state: bool) -> None:
+        if not state:
+            QToolTip.hideText()
+            return
+        if point is None:
+            QToolTip.hideText()
+            return
+        timestamp = int(round(point.x()))
+        data = self._tat_tooltip_data.get(timestamp)
+        if not data:
+            QToolTip.hideText()
+            return
+        dt_value, avg_seconds, test_count = data
+        date_text = dt_value.strftime("%Y-%m-%d")
+        hours = int(avg_seconds // 3600)
+        minutes = int((avg_seconds % 3600) // 60)
+        tooltip = f"{date_text}\nAvg TAT: {hours:02d}h {minutes:02d}m"
+        if test_count:
+            tooltip += f"\nTests: {test_count}"
+        QToolTip.showText(QCursor.pos(), tooltip, self.tat_chart_view)
+
+    def _update_tat_chart(
+        self,
+        daily_data: Optional[List[Dict[str, Any]]],
+        previous_data: Optional[List[Dict[str, Any]]],
+    ) -> None:
+        points = self._normalize_tat_data(daily_data)
+        previous_points = self._normalize_tat_data(previous_data)
+
+        for series in (
+            self.tat_line_series,
+            self.tat_under_series,
+            self.tat_zero_series,
+            self.tat_over_series,
+            self.tat_threshold_series,
+            self.tat_moving_avg_series,
+            self.tat_previous_series,
+        ):
+            series.clear()
+        self._tat_tooltip_data.clear()
+
+        target_hours = self._tat_target_seconds / 3600.0
+        if not points:
+            now = datetime.now(timezone.utc)
+            start = now - timedelta(days=6)
+            q_start = QDateTime(start)
+            q_end = QDateTime(now)
+            self.tat_axis_x.setRange(q_start, q_end)
+            max_hours = max(target_hours, 1.0)
+            self.tat_axis_y.setRange(0.0, max_hours)
+            self.tat_compare_checkbox.setEnabled(False)
+            self.tat_previous_series.setVisible(False)
+            return
+
+        timestamps: List[Tuple[int, float, float, int, datetime]] = []
+        for dt_value, avg_seconds, test_count in points:
+            qdt = QDateTime(dt_value)
+            timestamp = qdt.toMSecsSinceEpoch()
+            value_hours = avg_seconds / 3600.0
+            self.tat_line_series.append(timestamp, value_hours)
+            self.tat_zero_series.append(timestamp, 0.0)
+            under_value = min(value_hours, target_hours)
+            self.tat_under_series.append(timestamp, under_value)
+            self.tat_threshold_series.append(timestamp, target_hours)
+            over_value = value_hours if value_hours > target_hours else target_hours
+            self.tat_over_series.append(timestamp, over_value)
+            self._tat_tooltip_data[int(timestamp)] = (dt_value, avg_seconds, test_count)
+            timestamps.append((timestamp, value_hours, avg_seconds, test_count, dt_value))
+
+        moving_window: List[float] = []
+        for timestamp, value_hours, avg_seconds, _, _ in timestamps:
+            moving_window.append(avg_seconds)
+            if len(moving_window) > self._tat_moving_average_window:
+                moving_window.pop(0)
+            moving_avg = sum(moving_window) / len(moving_window)
+            self.tat_moving_avg_series.append(timestamp, moving_avg / 3600.0)
+
+        min_dt = points[0][0]
+        max_dt = points[-1][0]
+        self.tat_axis_x.setRange(QDateTime(min_dt), QDateTime(max_dt))
+
+        max_hours = max(target_hours, max(value_hours for _, value_hours, _, _, _ in timestamps))
+        self.tat_axis_y.setRange(0.0, max(1.0, max_hours * 1.2))
+
+        self.tat_previous_series.clear()
+        if previous_points and timestamps:
+            prev_values_hours = [avg_seconds / 3600.0 for _, avg_seconds, _ in previous_points]
+            for index, (timestamp, _, _, _, _) in enumerate(timestamps):
+                if index >= len(prev_values_hours):
+                    break
+                self.tat_previous_series.append(timestamp, prev_values_hours[index])
+
+        has_previous = self.tat_previous_series.count() > 0
+        self.tat_compare_checkbox.setEnabled(has_previous)
+        if not has_previous:
+            self.tat_compare_checkbox.setChecked(False)
+        self.tat_previous_series.setVisible(self.tat_compare_checkbox.isChecked() and has_previous)
+
+    def _normalize_tat_data(
+        self,
+        payload: Optional[List[Dict[str, Any]]],
+    ) -> List[Tuple[datetime, float, int]]:
+        normalized: List[Tuple[datetime, float, int]] = []
+        if not payload:
+            return normalized
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            dt_value = self._coerce_datetime(item.get("date"))
+            if not dt_value:
+                continue
+            avg_seconds = float(item.get("average_seconds") or 0.0)
+            test_count = int(item.get("test_count") or 0)
+            normalized.append((dt_value, avg_seconds, test_count))
+        normalized.sort(key=lambda entry: entry[0])
+        return normalized
+
+    @staticmethod
+    def _coerce_datetime(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        if isinstance(value, str):
+            text = value.strip()
+            if not text:
+                return None
+            if text.endswith("Z"):
+                text = text[:-1] + "+00:00"
+            try:
+                parsed = datetime.fromisoformat(text)
+            except ValueError:
+                return None
+            return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+        return None
 
     def _update_top_tests(self, records: List[Dict[str, Any]]) -> None:
         table = self.top_tests_table
@@ -501,56 +738,6 @@ class MainWindow(QMainWindow):
             table.setItem(row, 0, id_item)
             table.setItem(row, 1, name_item)
             table.setItem(row, 2, tests_item)
-        table.resizeRowsToContents()
-
-    def _update_reports_table(self, reports: List[Dict[str, Any]]) -> None:
-        table = self.reports_table
-        table.clearContents()
-        table.setRowCount(0)
-        fallback = datetime.min.replace(tzinfo=timezone.utc)
-        records = list(reports or [])
-
-        def sort_key(item: Dict[str, Any]) -> datetime:
-            value = item.get("date_generated") if isinstance(item, dict) else None
-            if isinstance(value, datetime):
-                return value
-            return fallback
-
-        records.sort(key=sort_key, reverse=True)
-        records = records[:10]
-        if not records:
-            table.setRowCount(1)
-            table.setSpan(0, 0, 1, table.columnCount())
-            item = QTableWidgetItem("No reports")
-            item.setTextAlignment(Qt.AlignCenter)
-            table.setItem(0, 0, item)
-            return
-
-        table.setRowCount(len(records))
-        for row, record in enumerate(records):
-            identifier = record.get("id")
-            sample = record.get("sample_id") or ""
-            tests = record.get("test_ids")
-            if isinstance(tests, (list, tuple)):
-                tests_text = ", ".join(str(value) for value in tests if value not in (None, ""))
-            elif tests is None:
-                tests_text = ""
-            else:
-                tests_text = str(tests)
-            generated = self._format_timestamp(record.get("date_generated"))
-
-            id_item = QTableWidgetItem(str(identifier) if identifier is not None else "")
-            sample_item = QTableWidgetItem(str(sample))
-            tests_item = QTableWidgetItem(tests_text)
-            generated_item = QTableWidgetItem(generated)
-
-            for item_widget in (id_item, sample_item, tests_item, generated_item):
-                item_widget.setFlags(item_widget.flags() & ~Qt.ItemIsEditable)
-
-            table.setItem(row, 0, id_item)
-            table.setItem(row, 1, sample_item)
-            table.setItem(row, 2, tests_item)
-            table.setItem(row, 3, generated_item)
         table.resizeRowsToContents()
 
     def _update_new_customers(self, customers: List[Dict[str, Any]]) -> None:
@@ -596,7 +783,7 @@ class MainWindow(QMainWindow):
         if isinstance(value, datetime):
             dt = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
             dt = dt.astimezone(timezone.utc)
-            return dt.strftime('%Y-%m-%d %H:%M')
+            return dt.strftime('%Y-%m-%d')
         if isinstance(value, str):
             return value
         return ''
@@ -721,11 +908,11 @@ class MainWindow(QMainWindow):
         else:
             self._update_top_tests([])
 
-        reports_recent = summary.get("reports_recent")
-        if isinstance(reports_recent, list):
-            self._update_reports_table(reports_recent)
-        else:
-            self._update_reports_table([])
+        tat_daily = summary.get("tests_tat_daily")
+        tat_previous = summary.get("tests_tat_daily_previous")
+        daily_list = tat_daily if isinstance(tat_daily, list) else []
+        previous_list = tat_previous if isinstance(tat_previous, list) else []
+        self._update_tat_chart(daily_list, previous_list)
 
         range_text = self._format_range(start_dt, end_dt)
         now = datetime.now(timezone.utc)
