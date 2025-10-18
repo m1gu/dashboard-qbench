@@ -7,7 +7,7 @@ Aplicación de escritorio construida con PySide6 para visualizar métricas recie
 - Consulta de muestras, tests y clientes con manejo de paginación y reintentos.
 - Métricas clave en la cabecera: Samples, Tests, Customers, Reports y TAT promedio.
 - Gráfico de líneas interactivo para samples y tests con tooltips.
-- Selector de rango de fechas con validaciones (máximo 30 días).
+- Selector de rango de fechas con validaciones flexibles (sin límite fijo de días).
 
 ## Requisitos
 - Python 3.10+

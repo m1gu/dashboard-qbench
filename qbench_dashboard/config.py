@@ -17,6 +17,11 @@ class QBenchSettings:
     jwt_ttl: int = 3300
 
 
+@dataclass
+class LocalAPISettings:
+    base_url: str
+
+
 def get_qbench_settings() -> QBenchSettings:
     base_url = os.getenv("QBENCH_BASE_URL", "").rstrip("/")
     client_id = os.getenv("QBENCH_CLIENT_ID", "")
@@ -42,3 +47,13 @@ def get_qbench_settings() -> QBenchSettings:
         jwt_leeway=jwt_leeway,
         jwt_ttl=jwt_ttl,
     )
+
+
+def get_local_api_settings() -> LocalAPISettings:
+    base_url = os.getenv("LOCAL_API_BASE_URL", "http://localhost:8000").rstrip("/")
+    return LocalAPISettings(base_url=base_url)
+
+
+def get_data_provider() -> str:
+    """Returns the configured data provider: 'qbench' or 'local'"""
+    return os.getenv("DATA_PROVIDER", "qbench").lower()

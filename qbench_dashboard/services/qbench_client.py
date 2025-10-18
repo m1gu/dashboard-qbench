@@ -1,5 +1,4 @@
 import time
-import json
 from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -7,13 +6,14 @@ import jwt
 import requests
 
 from qbench_dashboard.config import QBenchSettings, get_qbench_settings
+from qbench_dashboard.services.client_interface import DataClientInterface
 
 
 class QBenchError(RuntimeError):
     pass
 
 
-class QBenchClient:
+class QBenchClient(DataClientInterface):
     def __init__(self, settings: Optional[QBenchSettings] = None) -> None:
         self.settings = settings or get_qbench_settings()
         self._token_exp = 0.0
@@ -104,7 +104,7 @@ class QBenchClient:
         end_date: Optional[datetime] = None,
         *,
         page_size: int = 50,
-        max_days: int = 30,
+        max_days: Optional[int] = None,
         default_days: int = 7,
     ) -> List[Dict[str, Any]]:
         """Fetch samples within a given date range (defaults to the last 7 days)."""
@@ -127,12 +127,12 @@ class QBenchClient:
             return dt
 
         end_dt = _normalize(end_date, pad_end=True) or now
-        lookback_days = max(1, min(default_days, max_days))
+        lookback_days = max(1, min(default_days, max_days)) if max_days is not None else max(1, default_days)
         start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=lookback_days)
 
         if end_dt < start_dt:
             raise ValueError("Start date must be before or equal to end date.")
-        if end_dt - start_dt > timedelta(days=max_days):
+        if max_days is not None and end_dt - start_dt > timedelta(days=max_days):
             raise ValueError(f"Date range cannot exceed {max_days} days.")
 
         samples: List[Dict[str, Any]] = []
@@ -173,12 +173,20 @@ class QBenchClient:
         end_date: Optional[datetime] = None,
         *,
         page_size: int = 50,
-        max_days: int = 30,
+        max_days: Optional[int] = None,
         default_days: int = 7,
         sample_ids: Optional[Sequence[Union[str, int]]] = None,
-        chunk_size: int = 40,
-    ) -> Tuple[int, List[Tuple[datetime, int]], float, int, List[Tuple[datetime, float, int]]]:
-        """Collect tests created within a date range and return totals and series."""
+        chunk_size: int = 100,
+        previous_range: Optional[Tuple[Optional[datetime], Optional[datetime]]] = None,
+    ) -> Tuple[
+        int,
+        List[Tuple[datetime, int]],
+        float,
+        int,
+        List[Tuple[datetime, float, int]],
+        List[Tuple[datetime, float, int]],
+    ]:
+        """Collect tests created within a date range and optionally include a comparison period."""
         now = datetime.now(timezone.utc)
 
         def _normalize(value: Optional[Union[datetime, date]], *, pad_end: bool) -> Optional[datetime]:
@@ -198,13 +206,34 @@ class QBenchClient:
             return dt
 
         end_dt = _normalize(end_date, pad_end=True) or now
-        lookback_days = max(1, min(default_days, max_days))
+        lookback_days = max(1, min(default_days, max_days)) if max_days is not None else max(1, default_days)
         start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=lookback_days)
 
         if end_dt < start_dt:
             raise ValueError("Start date must be before or equal to end date.")
-        if end_dt - start_dt > timedelta(days=max_days):
+        if max_days is not None and end_dt - start_dt > timedelta(days=max_days):
             raise ValueError(f"Date range cannot exceed {max_days} days.")
+
+        include_previous = previous_range is not None
+        previous_start_dt: Optional[datetime] = None
+        previous_end_dt: Optional[datetime] = None
+        if include_previous:
+            raw_prev_start, raw_prev_end = previous_range or (None, None)
+            previous_start_dt = _normalize(raw_prev_start, pad_end=False)
+            previous_end_dt = _normalize(raw_prev_end, pad_end=True)
+            if previous_start_dt and previous_end_dt and previous_end_dt < previous_start_dt:
+                previous_start_dt, previous_end_dt = previous_end_dt, previous_start_dt
+            if previous_start_dt is None or previous_end_dt is None:
+                period = end_dt - start_dt
+                previous_end_dt = start_dt - timedelta(microseconds=1)
+                previous_start_dt = previous_end_dt - period
+            if max_days is not None and previous_end_dt - previous_start_dt > timedelta(days=max_days):
+                raise ValueError(f"Comparison range cannot exceed {max_days} days.")
+            if sample_ids:
+                sample_ids = None
+
+        effective_start = min(filter(None, [start_dt, previous_start_dt])) if include_previous else start_dt
+        effective_end = max(filter(None, [end_dt, previous_end_dt])) if include_previous else end_dt
 
         from collections import Counter
 
@@ -214,6 +243,8 @@ class QBenchClient:
         duration_count = 0
         tat_seconds_by_day: Dict[date, float] = {}
         tat_counts_by_day: Dict[date, int] = {}
+        tat_seconds_previous: Dict[date, float] = {}
+        tat_counts_previous: Dict[date, int] = {}
 
         def _process_page(items: List[Dict[str, Any]]) -> bool:
             nonlocal total, sum_seconds, duration_count
@@ -224,23 +255,38 @@ class QBenchClient:
                 created = self._parse_date(item.get("date_created"))
                 if not isinstance(created, datetime):
                     continue
-                if created > end_dt:
+                if effective_end and created > effective_end:
                     continue
-                if created < start_dt:
+                if effective_start and created < effective_start:
                     stop = True
                     break
-                total += 1
-                counter[created.date()] += 1
-
+                within_current = start_dt <= created <= end_dt
+                within_previous = (
+                    include_previous
+                    and previous_start_dt is not None
+                    and previous_end_dt is not None
+                    and previous_start_dt <= created <= previous_end_dt
+                )
+                if not within_current and not within_previous:
+                    continue
                 completed = self._parse_date(item.get("report_completed_date"))
-                if isinstance(completed, datetime):
+                if within_current:
+                    total += 1
+                    counter[created.date()] += 1
+                    if isinstance(completed, datetime):
+                        delta = (completed - created).total_seconds()
+                        if delta > 0:
+                            sum_seconds += delta
+                            duration_count += 1
+                            day = created.date()
+                            tat_seconds_by_day[day] = tat_seconds_by_day.get(day, 0.0) + float(delta)
+                            tat_counts_by_day[day] = tat_counts_by_day.get(day, 0) + 1
+                elif within_previous and isinstance(completed, datetime):
                     delta = (completed - created).total_seconds()
                     if delta > 0:
-                        sum_seconds += delta
-                        duration_count += 1
                         day = created.date()
-                        tat_seconds_by_day[day] = tat_seconds_by_day.get(day, 0.0) + float(delta)
-                        tat_counts_by_day[day] = tat_counts_by_day.get(day, 0) + 1
+                        tat_seconds_previous[day] = tat_seconds_previous.get(day, 0.0) + float(delta)
+                        tat_counts_previous[day] = tat_counts_previous.get(day, 0) + 1
             return stop
 
         def _iterate(params: Dict[str, Any]) -> None:
@@ -271,7 +317,7 @@ class QBenchClient:
                     seen.add(key)
                     ids.append(key)
             if not ids:
-                return 0, [], 0.0, 0
+                return 0, [], 0.0, 0, [], []
             step = max(1, chunk_size)
             for index in range(0, len(ids), step):
                 chunk = ids[index : index + step]
@@ -306,7 +352,20 @@ class QBenchClient:
                     int(count_value),
                 )
             )
-        return total, series, sum_seconds, duration_count, tat_daily
+        tat_previous_daily: List[Tuple[datetime, float, int]] = []
+        if include_previous:
+            for day in sorted(tat_seconds_previous.keys()):
+                seconds_total = tat_seconds_previous.get(day, 0.0)
+                count_value = tat_counts_previous.get(day, 0)
+                average = seconds_total / count_value if count_value > 0 else 0.0
+                tat_previous_daily.append(
+                    (
+                        datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc),
+                        average,
+                        int(count_value),
+                    )
+                )
+        return total, series, sum_seconds, duration_count, tat_daily, tat_previous_daily
 
     def count_recent_customers(
         self,
@@ -314,7 +373,7 @@ class QBenchClient:
         end_date: Optional[datetime] = None,
         *,
         page_size: int = 50,
-        max_days: int = 30,
+        max_days: Optional[int] = None,
         default_days: int = 7,
     ) -> int:
         """Count customers created within the given date range."""
@@ -337,12 +396,12 @@ class QBenchClient:
             return dt
 
         end_dt = _normalize(end_date, pad_end=True) or now
-        lookback_days = max(1, min(default_days, max_days))
+        lookback_days = max(1, min(default_days, max_days)) if max_days is not None else max(1, default_days)
         start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=lookback_days)
 
         if end_dt < start_dt:
             raise ValueError("Start date must be before or equal to end date.")
-        if end_dt - start_dt > timedelta(days=max_days):
+        if max_days is not None and end_dt - start_dt > timedelta(days=max_days):
             raise ValueError(f"Date range cannot exceed {max_days} days.")
 
         total = 0
@@ -391,7 +450,7 @@ class QBenchClient:
         end_date: Optional[datetime] = None,
         *,
         page_size: int = 50,
-        max_days: int = 30,
+        max_days: Optional[int] = None,
         default_days: int = 7,
     ) -> List[Dict[str, Any]]:
         """Fetch customers created within the given date range."""
@@ -414,12 +473,12 @@ class QBenchClient:
             return dt
 
         end_dt = _normalize(end_date, pad_end=True) or now
-        lookback_days = max(1, min(default_days, max_days))
+        lookback_days = max(1, min(default_days, max_days)) if max_days is not None else max(1, default_days)
         start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=lookback_days)
 
         if end_dt < start_dt:
             raise ValueError("Start date must be before or equal to end date.")
-        if end_dt - start_dt > timedelta(days=max_days):
+        if max_days is not None and end_dt - start_dt > timedelta(days=max_days):
             raise ValueError(f"Date range cannot exceed {max_days} days.")
 
         customers: List[Dict[str, Any]] = []
@@ -464,62 +523,13 @@ class QBenchClient:
 
         return customers
 
-    def fetch_reports_for_samples(
-        self,
-        sample_ids: Sequence[Union[str, int]],
-    ) -> List[Dict[str, Any]]:
-        """Fetch report metadata for the provided sample IDs."""
-        reports: List[Dict[str, Any]] = []
-        for sample_id in sample_ids:
-            sample_key = str(sample_id).strip()
-            if not sample_key:
-                continue
-            try:
-                payload = self._request(self.session.get, f"report/sample/{sample_key}/info")
-            except QBenchError:
-                continue
-            normalized = self._normalize_report(payload, sample_key)
-            if normalized:
-                reports.append(normalized)
-        return reports
-
-    def fetch_sample_tests(
-        self,
-        sample_ids: Sequence[Union[str, int]],
-    ) -> Dict[str, Dict[str, Dict[str, str]]]:
-        """Fetch tests (including label abbreviations) for the provided sample IDs."""
-        results: Dict[str, Dict[str, Dict[str, str]]] = {}
-        unique_ids: List[str] = []
-        seen: set[str] = set()
-        for sample_id in sample_ids:
-            key = str(sample_id).strip()
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            unique_ids.append(key)
-
-        for sample_key in unique_ids:
-            try:
-                payload = self._request(
-                    self.session.get,
-                    f"sample/{sample_key}",
-                    params={"include": "tests"},
-                )
-            except QBenchError:
-                continue
-            tests = self._extract_tests_from_sample(payload)
-            if tests:
-                results[sample_key] = tests
-        return results
-
-
     def fetch_recent_orders(
         self,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
         *,
         page_size: int = 50,
-        max_days: int = 30,
+        max_days: Optional[int] = None,
         default_days: int = 7,
     ) -> List[Dict[str, Any]]:
         """Fetch orders within a given date range."""
@@ -542,12 +552,12 @@ class QBenchClient:
             return dt
 
         end_dt = _normalize(end_date, pad_end=True) or now
-        lookback_days = max(1, min(default_days, max_days))
+        lookback_days = max(1, min(default_days, max_days)) if max_days is not None else max(1, default_days)
         start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=lookback_days)
 
         if end_dt < start_dt:
             raise ValueError("Start date must be before or equal to end date.")
-        if end_dt - start_dt > timedelta(days=max_days):
+        if max_days is not None and end_dt - start_dt > timedelta(days=max_days):
             raise ValueError(f"Date range cannot exceed {max_days} days.")
 
         orders: List[Dict[str, Any]] = []
@@ -662,86 +672,6 @@ class QBenchClient:
             "id": str(customer_id) if customer_id is not None else "",
             "name": name,
             "date_created": created,
-        }
-
-    def _normalize_report(self, payload: Any, sample_id: str) -> Optional[Dict[str, Any]]:
-        if not isinstance(payload, dict):
-            return None
-        report_id = payload.get("id")
-        if report_id is None:
-            return None
-        date_generated = self._parse_date(payload.get("date_generated"))
-        date_published = self._parse_date(payload.get("date_published"))
-        date_emailed = self._parse_date(payload.get("date_emailed"))
-        order_id = payload.get("order_id")
-        test_ids: List[str] = []
-        raw_params = payload.get("render_params")
-        if isinstance(raw_params, str) and raw_params:
-            try:
-                params_obj = json.loads(raw_params)
-            except json.JSONDecodeError:
-                params_obj = None
-            if isinstance(params_obj, dict):
-                raw_tests = params_obj.get("test_ids")
-                if isinstance(raw_tests, list):
-                    for value in raw_tests:
-                        if value is None:
-                            continue
-                        test_ids.append(str(value))
-        if not test_ids:
-            raw_tests = payload.get("test_ids")
-            if isinstance(raw_tests, list):
-                for value in raw_tests:
-                    if value is None:
-                        continue
-                    test_ids.append(str(value))
-            elif raw_tests is not None:
-                test_ids.append(str(raw_tests))
-        return {
-            "id": str(report_id),
-            "sample_id": sample_id,
-            "order_id": str(order_id) if order_id not in (None, "") else None,
-            "date_generated": date_generated,
-            "date_published": date_published,
-            "date_emailed": date_emailed,
-            "test_ids": test_ids,
-        }
-
-    def _extract_tests_from_sample(self, payload: Any) -> Dict[str, Dict[str, str]]:
-        tests: Dict[str, Dict[str, str]] = {}
-
-        def _collect(node: Any) -> None:
-            if isinstance(node, dict):
-                for key, value in node.items():
-                    if key == "tests" and isinstance(value, list):
-                        for item in value:
-                            normalized = self._normalize_test(item)
-                            if not normalized:
-                                continue
-                            test_id = normalized.get("id")
-                            if test_id:
-                                tests[test_id] = normalized
-                    else:
-                        _collect(value)
-            elif isinstance(node, list):
-                for item in node:
-                    _collect(item)
-
-        _collect(payload)
-        return tests
-
-    def _normalize_test(self, raw: Any) -> Optional[Dict[str, Any]]:
-        if not isinstance(raw, dict):
-            return None
-        test_id = raw.get("id") or raw.get("test_id")
-        if test_id is None:
-            return None
-        title = raw.get("title") or raw.get("name") or raw.get("test_name") or ""
-        label = raw.get("label_abbr") or raw.get("label_abbreviation") or raw.get("abbr") or ""
-        return {
-            "id": str(test_id),
-            "title": str(title) if title not in (None, "") else "",
-            "label_abbr": str(label) if label not in (None, "") else "",
         }
 
     def _normalize_sample(self, raw: Any) -> Optional[Dict[str, Any]]:

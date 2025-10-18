@@ -3,6 +3,8 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Tuple
 
+from concurrent.futures import ThreadPoolExecutor
+
 from PySide6.QtCharts import (
     QAreaSeries,
     QBarCategoryAxis,
@@ -37,7 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from qbench_dashboard.services.qbench_client import QBenchClient
+from qbench_dashboard.services.client_interface import DataClientInterface
 from qbench_dashboard.services.summary import build_summary
 
 
@@ -47,7 +49,7 @@ class SummaryWorker(QObject):
 
     def __init__(
         self,
-        client: QBenchClient,
+        client: DataClientInterface,
         *,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
@@ -75,8 +77,8 @@ class SummaryWorker(QObject):
             ]
             sample_ids: List[str] = []
             seen_ids = set()
-            report_sample_ids: List[str] = []
             report_seen = set()
+            reports_total = 0
             for sample in samples:
                 sid = sample.get("id")
                 if sid and sid not in seen_ids:
@@ -85,13 +87,7 @@ class SummaryWorker(QObject):
                 has_report = sample.get("has_report") or str(sample.get("status", "")).upper() == "REPORTED"
                 if has_report and sid and sid not in report_seen:
                     report_seen.add(sid)
-                    report_sample_ids.append(sid)
-            tests_total, tests_series, tat_sum_seconds, tat_count, tat_daily = self._client.count_recent_tests(
-                start_date=self._start_date,
-                end_date=self._end_date,
-                sample_ids=sample_ids,
-            )
-            tat_previous_daily: List[Tuple[datetime, float, int]] = []
+                    reports_total += 1
             range_start = self._start_date
             range_end = self._end_date
             now_utc = datetime.now(timezone.utc)
@@ -102,40 +98,57 @@ class SummaryWorker(QObject):
             if range_end < range_start:
                 range_start, range_end = range_end, range_start
             period_delta = range_end - range_start
+            previous_range: Optional[Tuple[datetime, datetime]] = None
             if period_delta.total_seconds() > 0:
                 previous_end = range_start - timedelta(microseconds=1)
                 previous_start = previous_end - period_delta
+                previous_range = (previous_start, previous_end)
+            tests_sample_ids = sample_ids if previous_range is None else None
+
+            def _load_customers() -> Tuple[List[Dict[str, Any]], int]:
                 try:
-                    _, _, _, _, tat_previous_daily = self._client.count_recent_tests(
-                        start_date=previous_start,
-                        end_date=previous_end,
-                        sample_ids=None,
+                    records = self._client.fetch_recent_customers(
+                        start_date=self._start_date,
+                        end_date=self._end_date,
                     )
                 except Exception:
-                    tat_previous_daily = []
-            customers_total = 0
-            customer_records: List[Dict[str, Any]] = []
-            try:
-                customer_records = self._client.fetch_recent_customers(
+                    count_only = self._client.count_recent_customers(
+                        start_date=self._start_date,
+                        end_date=self._end_date,
+                    )
+                    return [], count_only
+                return records, len(records)
+
+            def _load_orders() -> List[Dict[str, Any]]:
+                try:
+                    return self._client.fetch_recent_orders(
+                        start_date=self._start_date,
+                        end_date=self._end_date,
+                    )
+                except Exception:
+                    return []
+
+            with ThreadPoolExecutor(max_workers=3) as executor:
+                tests_future = executor.submit(
+                    self._client.count_recent_tests,
                     start_date=self._start_date,
                     end_date=self._end_date,
+                    sample_ids=tests_sample_ids,
+                    previous_range=previous_range,
                 )
-            except Exception:
-                customers_total = self._client.count_recent_customers(
-                    start_date=self._start_date,
-                    end_date=self._end_date,
-                )
-            else:
-                customers_total = len(customer_records)
-            customer_orders: List[Dict[str, Any]] = []
-            try:
-                customer_orders = self._client.fetch_recent_orders(
-                    start_date=self._start_date,
-                    end_date=self._end_date,
-                )
-            except Exception:
-                customer_orders = []
-            reports_total = len(report_sample_ids)
+                customers_future = executor.submit(_load_customers)
+                orders_future = executor.submit(_load_orders)
+
+                (
+                    tests_total,
+                    tests_series,
+                    tat_sum_seconds,
+                    tat_count,
+                    tat_daily,
+                    tat_previous_daily,
+                ) = tests_future.result()
+                customer_records, customers_total = customers_future.result()
+                customer_orders = orders_future.result()
             toppers: List[Dict[str, Any]] = []
             if customer_orders:
                 name_map = {
@@ -206,7 +219,7 @@ class SummaryWorker(QObject):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, client: QBenchClient) -> None:
+    def __init__(self, client: DataClientInterface) -> None:
         super().__init__()
         self._client = client
         self._thread: Optional[QThread] = None
@@ -993,8 +1006,6 @@ class MainWindow(QMainWindow):
         )
         if end_dt < start_dt:
             raise ValueError("Start date cannot be after the end date.")
-        if end_dt - start_dt > timedelta(days=30):
-            raise ValueError("The date range cannot exceed 30 days.")
         return start_dt, end_dt
 
     def _advance_spinner(self) -> None:
@@ -1046,7 +1057,7 @@ class MainWindow(QMainWindow):
         box.exec()
 
 
-def launch_app(client: QBenchClient) -> None:
+def launch_app(client: DataClientInterface) -> None:
     app = QApplication.instance() or QApplication([])
     window = MainWindow(client)
     window.show()
