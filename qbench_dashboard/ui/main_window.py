@@ -3,8 +3,6 @@ from __future__ import annotations
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
-from concurrent.futures import ThreadPoolExecutor
-
 from PySide6.QtCharts import (
     QAreaSeries,
     QBarCategoryAxis,
@@ -13,10 +11,11 @@ from PySide6.QtCharts import (
     QChart,
     QChartView,
     QDateTimeAxis,
+    QHorizontalBarSeries,
     QLineSeries,
     QValueAxis,
 )
-from PySide6.QtCore import QDate, QDateTime, QLocale, QTimer, Qt, QThread, QObject, Signal
+from PySide6.QtCore import QDate, QDateTime, QLocale, QMargins, QTimer, Qt, QThread, QObject, Signal
 from PySide6.QtGui import QBrush, QCursor, QColor, QGradient, QLinearGradient, QPalette, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
@@ -33,6 +32,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QToolTip,
@@ -154,27 +155,21 @@ class SummaryWorker(QObject):
                 except Exception:
                     return []
 
-            with ThreadPoolExecutor(max_workers=3) as executor:
-                tests_future = executor.submit(
-                    self._client.count_recent_tests,
-                    start_date=self._start_date,
-                    end_date=self._end_date,
-                    sample_ids=tests_sample_ids,
-                    previous_range=previous_range,
-                )
-                customers_future = executor.submit(_load_customers)
-                orders_future = executor.submit(_load_orders)
-
-                (
-                    tests_total,
-                    tests_series,
-                    tat_sum_seconds,
-                    tat_count,
-                    tat_daily,
-                    tat_previous_daily,
-                ) = tests_future.result()
-                customer_records, customers_total = customers_future.result()
-                customer_orders = orders_future.result()
+            (
+                tests_total,
+                tests_series,
+                tat_sum_seconds,
+                tat_count,
+                tat_daily,
+                tat_previous_daily,
+            ) = self._client.count_recent_tests(
+                start_date=self._start_date,
+                end_date=self._end_date,
+                sample_ids=tests_sample_ids,
+                previous_range=previous_range,
+            )
+            customer_records, customers_total = _load_customers()
+            customer_orders = _load_orders()
             toppers: List[Dict[str, Any]] = []
             if customer_orders:
                 name_map = {
@@ -222,6 +217,13 @@ class SummaryWorker(QObject):
                         details = self._client.fetch_customer_details(entry["id"])
                         if details and details.get("name"):
                             entry["name"] = details.get("name") or entry["id"]
+            try:
+                label_distribution = self._client.fetch_test_label_distribution(
+                    start_date=self._start_date,
+                    end_date=self._end_date,
+                )
+            except Exception:
+                label_distribution = []
             if tests_series is None:
                 tests_series = []
             else:
@@ -242,6 +244,7 @@ class SummaryWorker(QObject):
                 reports_total=reports_total,
                 customers_recent=customer_records,
                 customer_test_totals=toppers,
+                tests_label_distribution=label_distribution,
                 start_date=self._start_date,
                 end_date=self._end_date,
             )
@@ -301,6 +304,7 @@ class MainWindow(QMainWindow):
         self._tat_target_seconds = 48 * 3600  # 48-hour SLA target by default
         self._tat_moving_average_window = 7
         self._tat_tooltip_data: Dict[int, Tuple[datetime, float, int]] = {}
+        self._test_type_categories: List[str] = []
 
         self.setWindowTitle("QBench Dashboard")
         self.resize(1280, 720)
@@ -383,7 +387,7 @@ class MainWindow(QMainWindow):
 
         self.chart_view = QChartView(self.chart)
         self.chart_view.setRenderHint(QPainter.Antialiasing, True)
-        self.chart_view.setMinimumHeight(320)
+        self.chart_view.setMinimumHeight(480)
         self.chart_view.setStyleSheet("background: rgba(32, 40, 62, 0.6);")
 
         self.bar_series.hovered.connect(self._on_bar_hover)
@@ -406,69 +410,33 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.refresh_button)
         controls_layout.addStretch()
 
-        metrics_layout = QGridLayout()
-        metrics_layout.setHorizontalSpacing(24)
-        metrics_layout.setVerticalSpacing(6)
-        metrics_layout.setColumnStretch(0, 1)
-        metrics_layout.setColumnStretch(1, 1)
-        metrics_layout.setColumnStretch(2, 1)
-        metrics_layout.setColumnStretch(3, 1)
-        metrics_layout.setColumnStretch(4, 1)
+        metrics_layout = QHBoxLayout()
+        metrics_layout.setSpacing(16)
 
-        metrics_layout.setColumnStretch(0, 1)
-        metrics_layout.setColumnStretch(1, 1)
-        metrics_layout.setColumnStretch(2, 1)
-        metrics_layout.setColumnStretch(3, 1)
-        metrics_layout.setColumnStretch(4, 1)
+        self.samples_card, self.samples_value = self._create_metric_card("Samples", "#E0E8FF")
+        self.tests_card, self.tests_value = self._create_metric_card("Tests", "#7EE787")
+        self.customers_card, self.customers_value = self._create_metric_card("Customers", "#F4B400")
+        self.reports_card, self.reports_value = self._create_metric_card("Reports", "#FF8FAB")
+        self.tat_card, self.tat_value = self._create_metric_card("Avg TAT", "#60CDF1")
 
-        self.samples_value = QLabel("--")
-        self.samples_value.setAlignment(Qt.AlignCenter)
-        self.samples_value.setStyleSheet("font-size: 26px; font-weight: 600; color: #E0E8FF;")
-        self.samples_label = QLabel("Samples")
-        self.samples_label.setAlignment(Qt.AlignCenter)
-        self.samples_label.setStyleSheet("color: #B0BCD5;")
+        for card in (
+            self.samples_card,
+            self.tests_card,
+            self.customers_card,
+            self.reports_card,
+            self.tat_card,
+        ):
+            metrics_layout.addWidget(card, 1)
 
-        self.tests_value = QLabel("--")
-        self.tests_value.setAlignment(Qt.AlignCenter)
-        self.tests_value.setStyleSheet("font-size: 26px; font-weight: 600; color: #7EE787;")
-        self.tests_label = QLabel("Tests")
-        self.tests_label.setAlignment(Qt.AlignCenter)
-        self.tests_label.setStyleSheet("color: #B0BCD5;")
+        content_layout = QVBoxLayout()
+        content_layout.setSpacing(20)
 
-        self.customers_value = QLabel("--")
-        self.customers_value.setAlignment(Qt.AlignCenter)
-        self.customers_value.setStyleSheet("font-size: 26px; font-weight: 600; color: #F4B400;")
-        self.customers_label = QLabel("Customers")
-        self.customers_label.setAlignment(Qt.AlignCenter)
-        self.customers_label.setStyleSheet("color: #B0BCD5;")
+        header_label = QLabel("MCRLabs Metrics")
+        header_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header_label.setStyleSheet("color: #E0E8FF; font-size: 26px; font-weight: 700;")
+        content_layout.addWidget(header_label)
 
-        self.reports_value = QLabel("--")
-        self.reports_value.setAlignment(Qt.AlignCenter)
-        self.reports_value.setStyleSheet("font-size: 26px; font-weight: 600; color: #FF8FAB;")
-        self.reports_label = QLabel("Reports")
-        self.reports_label.setAlignment(Qt.AlignCenter)
-        self.reports_label.setStyleSheet("color: #B0BCD5;")
-
-        self.tat_value = QLabel("--")
-        self.tat_value.setAlignment(Qt.AlignCenter)
-        self.tat_value.setStyleSheet("font-size: 26px; font-weight: 600; color: #60CDF1;")
-        self.tat_label = QLabel("Avg TAT")
-        self.tat_label.setAlignment(Qt.AlignCenter)
-        self.tat_label.setStyleSheet("color: #B0BCD5;")
-
-        metrics_layout.addWidget(self.samples_value, 0, 0)
-        metrics_layout.addWidget(self.samples_label, 1, 0)
-        metrics_layout.addWidget(self.tests_value, 0, 1)
-        metrics_layout.addWidget(self.tests_label, 1, 1)
-        metrics_layout.addWidget(self.customers_value, 0, 2)
-        metrics_layout.addWidget(self.customers_label, 1, 2)
-        metrics_layout.addWidget(self.reports_value, 0, 3)
-        metrics_layout.addWidget(self.reports_label, 1, 3)
-        metrics_layout.addWidget(self.tat_value, 0, 4)
-        metrics_layout.addWidget(self.tat_label, 1, 4)
-        layout = QVBoxLayout()
-        layout.setSpacing(20)
-        layout.addLayout(metrics_layout)
+        content_layout.addLayout(metrics_layout)
 
         status_layout = QHBoxLayout()
         status_layout.setContentsMargins(0, 0, 0, 0)
@@ -476,15 +444,31 @@ class MainWindow(QMainWindow):
         status_layout.setAlignment(Qt.AlignCenter)
         status_layout.addWidget(self.spinner_label)
         status_layout.addWidget(self.status_label)
-        layout.addLayout(status_layout)
+        content_layout.addLayout(status_layout)
 
-        layout.addLayout(controls_layout)
-        layout.addWidget(self.chart_view)
-        self._init_bottom_lists(layout)
+        content_layout.addLayout(controls_layout)
+        content_layout.addWidget(self.chart_view)
+        self._init_bottom_lists(content_layout)
+        self._add_tat_section(content_layout)
+
+        content_layout.addStretch()
+
+        content_widget = QWidget()
+        content_widget.setLayout(content_layout)
+        content_widget.setStyleSheet("background-color: #0F172A;")
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setStyleSheet("QScrollArea { background-color: #0F172A; }")
+        scroll_area.setWidget(content_widget)
 
         container = QWidget()
-        container.setLayout(layout)
         container.setStyleSheet("background-color: #0F172A;")
+        container_layout = QVBoxLayout(container)
+        container_layout.setContentsMargins(0, 0, 0, 0)
+        container_layout.setSpacing(0)
+        container_layout.addWidget(scroll_area)
 
         self.setCentralWidget(container)
 
@@ -499,9 +483,39 @@ class MainWindow(QMainWindow):
         top_tests_panel = self._create_list_panel("Top 10 customers with more tests", self.top_tests_table)
         lists_layout.addWidget(top_tests_panel, 1)
 
-        tat_panel = self._create_tat_panel()
-        lists_layout.addWidget(tat_panel, 1)
+        self.test_types_panel = self._create_test_types_panel()
+        lists_layout.addWidget(self.test_types_panel, 1)
         parent_layout.addLayout(lists_layout)
+
+    def _add_tat_section(self, parent_layout: QVBoxLayout) -> None:
+        tat_panel = self._create_tat_panel()
+        tat_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+        parent_layout.addWidget(tat_panel)
+
+    def _create_metric_card(self, title: str, value_color: str) -> Tuple[QFrame, QLabel]:
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setStyleSheet(
+            "QFrame { background-color: #111C34; border: 1px solid #1F3B73; border-radius: 10px; }"
+        )
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(6)
+
+        value_label = QLabel("--")
+        value_label.setAlignment(Qt.AlignLeft | Qt.AlignBottom)
+        value_label.setStyleSheet(f"font-size: 30px; font-weight: 600; color: {value_color};")
+
+        title_label = QLabel(title)
+        title_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        title_label.setStyleSheet("color: #B0BCD5; font-size: 13px; font-weight: 500;")
+
+        layout.addWidget(title_label)
+        layout.addSpacing(4)
+        layout.addWidget(value_label)
+        layout.addStretch()
+
+        return frame, value_label
 
     def _create_table_widget(self, headers: List[str]) -> QTableWidget:
         table = QTableWidget()
@@ -655,7 +669,7 @@ class MainWindow(QMainWindow):
 
         self.tat_chart_view = QChartView(self.tat_chart)
         self.tat_chart_view.setRenderHint(QPainter.Antialiasing, True)
-        self.tat_chart_view.setMinimumHeight(300)
+        self.tat_chart_view.setMinimumHeight(450)
         self.tat_chart_view.setStyleSheet("background: rgba(32, 40, 62, 0.6);")
         layout.addWidget(self.tat_chart_view)
 
@@ -669,14 +683,91 @@ class MainWindow(QMainWindow):
         controls_layout.addWidget(self.tat_compare_checkbox)
         layout.addLayout(controls_layout)
 
+        frame.setMinimumHeight(520)
         return frame
 
-    def _create_placeholder_panel(self, title: str) -> QFrame:
-        label = QLabel("Coming soon")
-        label.setAlignment(Qt.AlignCenter)
-        label.setWordWrap(True)
-        label.setStyleSheet("color: #5F718F; font-size: 13px;")
-        return self._create_list_panel(title, label)
+    def _create_test_types_panel(self) -> QFrame:
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setStyleSheet("QFrame { background-color: #111C34; border: 1px solid #1F3B73; border-radius: 10px; }")
+
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(4)
+
+        title_label = QLabel("Types of tests most requested")
+        title_label.setStyleSheet("color: #E0E8FF; font-weight: 600; font-size: 14px;")
+        layout.addWidget(title_label)
+
+        self.test_types_chart = QChart()
+        self.test_types_chart.setBackgroundBrush(Qt.transparent)
+        self.test_types_chart.setBackgroundRoundness(0)
+        distribution_legend = self.test_types_chart.legend()
+        distribution_legend.setVisible(True)
+        distribution_legend.setBackgroundVisible(False)
+        distribution_legend.setLabelBrush(QBrush(Qt.white))
+
+        self.test_types_series = QHorizontalBarSeries()
+        self.test_types_series.setLabelsVisible(False)
+
+        self.test_types_set = QBarSet("Tests")
+        self.test_types_set.setColor(QColor(0x7E, 0xE7, 0x87))
+        self.test_types_set.hovered.connect(lambda status, index: self._on_test_type_bar_hover(status, index))
+        self.test_types_series.append(self.test_types_set)
+
+        self.test_types_chart.addSeries(self.test_types_series)
+        self.test_types_chart.legend().setAlignment(Qt.AlignTop)
+
+        self.test_types_axis_values = QValueAxis()
+        self.test_types_axis_values.setLabelFormat("%d")
+        self.test_types_axis_values.setLabelsColor(Qt.white)
+        self.test_types_axis_values.setTitleText("Count")
+        self.test_types_axis_values.setTitleBrush(Qt.white)
+
+        self.test_types_axis_categories = QBarCategoryAxis()
+        self.test_types_axis_categories.setLabelsColor(Qt.white)
+
+        self.test_types_chart.addAxis(self.test_types_axis_values, Qt.AlignBottom)
+        self.test_types_chart.addAxis(self.test_types_axis_categories, Qt.AlignLeft)
+        self.test_types_series.attachAxis(self.test_types_axis_values)
+        self.test_types_series.attachAxis(self.test_types_axis_categories)
+
+
+        self.test_types_chart.setMargins(QMargins(20, 10, 20, 10))
+        if self.test_types_chart.layout() is not None:
+            self.test_types_chart.layout().setContentsMargins(0, 0, 0, 0)
+
+        self.test_types_chart_view = QChartView(self.test_types_chart)
+        self.test_types_chart_view.setRenderHint(QPainter.Antialiasing, True)
+        self.test_types_chart_view.setMinimumHeight(420)
+        self.test_types_chart_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.test_types_chart_view.setStyleSheet("background: rgba(32, 40, 62, 0.6);")
+
+        chart_container = QWidget()
+        chart_container_layout = QVBoxLayout(chart_container)
+        chart_container_layout.setContentsMargins(0, 0, 0, 0)
+        chart_container_layout.setSpacing(0)
+        chart_container_layout.addWidget(self.test_types_chart_view)
+
+        self.test_types_scroll = QScrollArea()
+        self.test_types_scroll.setWidgetResizable(True)
+        self.test_types_scroll.setFrameShape(QFrame.NoFrame)
+        self.test_types_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.test_types_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.test_types_scroll.setStyleSheet("QScrollArea { background-color: transparent; }")
+        self.test_types_scroll.setWidget(chart_container)
+
+
+        self.test_types_empty_label = QLabel("No test data for the selected range")
+        self.test_types_empty_label.setAlignment(Qt.AlignCenter)
+        self.test_types_empty_label.setStyleSheet("color: #5F718F; font-size: 13px;")
+        self.test_types_empty_label.setVisible(False)
+
+        layout.addWidget(self.test_types_scroll)
+        layout.addWidget(self.test_types_empty_label)
+
+        frame.setMinimumHeight(480)
+        return frame
 
     def _on_tat_compare_toggled(self, checked: bool) -> None:
         if not hasattr(self, "tat_previous_series"):
@@ -781,6 +872,101 @@ class MainWindow(QMainWindow):
         if not has_previous:
             self.tat_compare_checkbox.setChecked(False)
         self.tat_previous_series.setVisible(self.tat_compare_checkbox.isChecked() and has_previous)
+
+    def _update_test_type_chart(self, distribution: Optional[Sequence[Dict[str, Any]]]) -> None:
+        if not hasattr(self, "test_types_set"):
+            return
+        filtered: List[Tuple[str, int]] = []
+        if distribution:
+            for item in distribution:
+                if not isinstance(item, dict):
+                    continue
+                label = item.get("label") or item.get("label_abbr")
+                if not isinstance(label, str):
+                    continue
+                try:
+                    count = int(item.get("count") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if count <= 0:
+                    continue
+                filtered.append((label, count))
+
+        filtered.sort(key=lambda entry: entry[1], reverse=True)
+
+        chart = getattr(self, "test_types_chart", None)
+        series = getattr(self, "test_types_series", None)
+        axis_values = getattr(self, "test_types_axis_values", None)
+        axis_categories = getattr(self, "test_types_axis_categories", None)
+
+        if chart is None or series is None or axis_values is None or axis_categories is None:
+            return
+
+        try:
+            series.clear()
+        except (RuntimeError, AttributeError):
+            series = QHorizontalBarSeries()
+            chart.addSeries(series)
+            self.test_types_series = series
+
+        self.test_types_set = QBarSet("Tests")
+        self.test_types_set.setColor(QColor(0x7E, 0xE7, 0x87))
+        self.test_types_set.hovered.connect(lambda status, index: self._on_test_type_bar_hover(status, index))
+        self.test_types_series.append(self.test_types_set)
+
+        try:
+            self.test_types_series.attachAxis(axis_values)
+        except RuntimeError:
+            chart.addAxis(axis_values, Qt.AlignBottom)
+            self.test_types_series.attachAxis(axis_values)
+        try:
+            self.test_types_series.attachAxis(axis_categories)
+        except RuntimeError:
+            chart.addAxis(axis_categories, Qt.AlignLeft)
+            self.test_types_series.attachAxis(axis_categories)
+
+        axis_categories.clear()
+        self._test_type_categories = []
+
+        if not filtered:
+            if hasattr(self, "test_types_scroll"):
+                self.test_types_scroll.setVisible(False)
+            self.test_types_empty_label.setVisible(True)
+            self.test_types_axis_values.setRange(0, 1)
+            return
+
+        if hasattr(self, "test_types_scroll"):
+            self.test_types_scroll.setVisible(True)
+        self.test_types_empty_label.setVisible(False)
+
+        categories = [label for label, _ in filtered]
+        # Reverse so the highest value appears at the top of the horizontal bars
+        categories_reversed = list(reversed(categories))
+        counts_reversed = list(reversed([count for _, count in filtered]))
+
+        for value in counts_reversed:
+            self.test_types_set.append(float(value))
+
+        self.test_types_axis_categories.append(categories_reversed)
+        max_value = max(counts_reversed) if counts_reversed else 1
+        self.test_types_axis_values.setRange(0, max_value * 1.1 if max_value > 0 else 1)
+
+        self._test_type_categories = categories_reversed
+
+    def _on_test_type_bar_hover(self, status: bool, index: int) -> None:
+        if not status or index < 0:
+            QToolTip.hideText()
+            return
+        if index >= len(self._test_type_categories):
+            QToolTip.hideText()
+            return
+        try:
+            value = int(round(self.test_types_set.at(index)))
+        except (IndexError, RuntimeError):
+            QToolTip.hideText()
+            return
+        label = self._test_type_categories[index]
+        QToolTip.showText(QCursor.pos(), f"{label}: {value}", self.test_types_chart_view)
 
     def _normalize_tat_data(
         self,
@@ -1080,6 +1266,12 @@ class MainWindow(QMainWindow):
             self._update_top_tests(tests_leaderboard)
         else:
             self._update_top_tests([])
+
+        label_distribution = summary.get("tests_label_distribution")
+        if isinstance(label_distribution, list):
+            self._update_test_type_chart(label_distribution)
+        else:
+            self._update_test_type_chart([])
 
         tat_daily = summary.get("tests_tat_daily")
         tat_previous = summary.get("tests_tat_daily_previous")

@@ -18,6 +18,7 @@ def build_summary(
     reports_total: int = 0,
     customers_recent: Optional[Sequence[Dict[str, object]]] = None,
     customer_test_totals: Optional[Sequence[Dict[str, object]]] = None,
+    tests_label_distribution: Optional[Sequence[Dict[str, object]]] = None,
     start_date: Optional[datetime] = None,
     end_date: Optional[datetime] = None,
 ) -> Dict[str, object]:
@@ -96,6 +97,25 @@ def build_summary(
                 "test_count": int(count_value),
             })
 
+    label_distribution_payload = []
+    if tests_label_distribution:
+        for item in tests_label_distribution:
+            if not isinstance(item, dict):
+                continue
+            label = item.get("label") or item.get("label_abbr")
+            if not isinstance(label, str):
+                continue
+            try:
+                total = int(item.get("count") or 0)
+            except (TypeError, ValueError):
+                continue
+            if total <= 0:
+                continue
+            label_distribution_payload.append({
+                "label": label,
+                "count": total,
+            })
+
     return {
         "samples_total": samples_total,
         "samples_series": normalized_samples,
@@ -109,6 +129,7 @@ def build_summary(
         "reports_total": max(0, int(reports_total)),
         "customers_recent": customers_payload,
         "customer_test_totals": tests_leaderboard,
+        "tests_label_distribution": label_distribution_payload,
         "start_date": _as_utc(start_date),
         "end_date": _as_utc(end_date),
     }

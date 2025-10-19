@@ -439,8 +439,101 @@ class LocalAPIClient(DataClientInterface):
                 "date_created": start_dt + timedelta(hours=len(orders)),  # Stagger orders
                 "date_received": start_dt + timedelta(hours=len(orders)),
             })
-        
+
         return orders
+
+    def fetch_test_label_distribution(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        default_days: int = 7,
+        allowed_labels: Optional[Sequence[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """Fetch test label distribution from the local metrics endpoint."""
+        label_whitelist = tuple(allowed_labels or (
+            "CN",
+            "MB",
+            "TP",
+            "MY",
+            "HM",
+            "FFM",
+            "HO",
+            "HLVd",
+            "MC",
+            "PS",
+            "PN",
+            "RS",
+            "ST",
+            "SP",
+            "WA",
+            "YM",
+        ))
+        now = datetime.now(timezone.utc)
+
+        def _normalize(value: Optional[Union[datetime, date]], *, pad_end: bool) -> Optional[datetime]:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                dt = value
+            elif isinstance(value, date):
+                time_part = datetime.max.time() if pad_end else datetime.min.time()
+                dt = datetime.combine(value, time_part)
+            else:
+                raise TypeError(f"Unsupported date value: {type(value)!r}")
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            else:
+                dt = dt.astimezone(timezone.utc)
+            return dt
+
+        end_dt = _normalize(end_date, pad_end=True) or now
+        start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=max(1, default_days))
+        if end_dt < start_dt:
+            raise ValueError("Start date must be before or equal to end date.")
+
+        params = {
+            "date_from": start_dt.isoformat(),
+            "date_to": end_dt.isoformat(),
+        }
+        payload = self._request(self.session.get, "metrics/tests/label-distribution", params=params)
+
+        raw_items: Sequence[Any] = ()
+        if isinstance(payload, dict):
+            for key in ("distribution", "labels", "data", "results"):
+                value = payload.get(key)
+                if isinstance(value, list):
+                    raw_items = value
+                    break
+            else:
+                if isinstance(payload.get("items"), list):
+                    raw_items = payload["items"]  # type: ignore[index]
+        elif isinstance(payload, list):
+            raw_items = payload
+
+        distribution: List[Dict[str, Any]] = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            label_value = item.get("label_abbr") or item.get("label") or item.get("code")
+            if not isinstance(label_value, str):
+                continue
+            normalized_label = label_value.strip()
+            if normalized_label not in label_whitelist:
+                continue
+            count_value = item.get("count") or item.get("total") or item.get("value")
+            try:
+                numeric_count = int(count_value)
+            except (TypeError, ValueError):
+                continue
+            if numeric_count <= 0:
+                continue
+            distribution.append({
+                "label": normalized_label,
+                "count": numeric_count,
+            })
+
+        return distribution
 
     def get_last_samples_total(self) -> Optional[int]:
         return self._last_samples_total
