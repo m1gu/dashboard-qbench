@@ -17,6 +17,8 @@ class LocalAPIClient(DataClientInterface):
         self.settings = settings or get_local_api_settings()
         self.session = requests.Session()
         self._customer_cache: Dict[str, Dict[str, Any]] = {}
+        self._last_samples_total: Optional[int] = None
+        self._last_reports_total: Optional[int] = None
 
     def _request(self, method, path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.settings.base_url}/api/v1/{path.lstrip('/')}"
@@ -94,22 +96,68 @@ class LocalAPIClient(DataClientInterface):
             "date_from": start_dt.isoformat(),
             "date_to": end_dt.isoformat(),
         }
+        # reset cached totals for each fetch
+        self._last_samples_total = None
+        self._last_reports_total = None
+
         payload = self._request(self.session.get, "metrics/samples/overview", params=params)
-        
+
         # Convert the overview data to a format compatible with the current dashboard
-        samples = []
-        total_samples = payload.get("kpis", {}).get("total_samples", 0)
-        
+        samples: List[Dict[str, Any]] = []
+        kpis = payload.get("kpis", {}) if isinstance(payload, dict) else {}
+
+        def _to_int(value: Any) -> Optional[int]:
+            try:
+                return int(value)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                return None
+
+        overview_samples = _to_int(kpis.get("total_samples") or kpis.get("samples_total"))
+        if overview_samples is not None:
+            self._last_samples_total = max(0, overview_samples)
+
+        summary_kpis: Dict[str, Any] = {}
+        try:
+            summary_payload = self._request(self.session.get, "metrics/summary", params=params)
+        except LocalAPIError:
+            summary_payload = None
+        if isinstance(summary_payload, dict):
+            summary_kpis = summary_payload.get("kpis", {}) if isinstance(summary_payload.get("kpis"), dict) else {}
+
+        summary_samples = _to_int(summary_kpis.get("total_samples") or summary_kpis.get("samples_total"))
+        if summary_samples is not None:
+            self._last_samples_total = max(0, summary_samples)
+
+        reports_payload: Optional[Dict[str, Any]] = None
+        try:
+            reports_payload = self._request(self.session.get, "metrics/reports/overview", params=params)
+        except LocalAPIError:
+            reports_payload = None
+
+        reports_total_value: Optional[int] = None
+        if isinstance(reports_payload, dict):
+            reports_total_value = _to_int(
+                reports_payload.get("total_reports") or reports_payload.get("reports_total")
+            )
+        if reports_total_value is None:
+            reports_total_value = _to_int(summary_kpis.get("total_reports") or summary_kpis.get("reports_total"))
+        if reports_total_value is not None:
+            self._last_reports_total = max(0, reports_total_value)
+
         # Create sample entries based on the overview data
         # This is a simplified approach - in practice, we might need a dedicated endpoint
-        for i in range(min(total_samples, 100)):  # Limit to avoid too much data
+        samples_to_generate = self._last_samples_total or 0
+        for i in range(samples_to_generate):
+            scheduled = start_dt + timedelta(seconds=i * 3600)
+            if scheduled > end_dt:
+                break
             samples.append({
                 "id": f"sample_{i}",
-                "status": "completed" if i < total_samples * 0.8 else "pending",
-                "date_created": start_dt + timedelta(seconds=i * 3600),
-                "has_report": i < total_samples * 0.7,
+                "status": "completed" if i < samples_to_generate * 0.8 else "pending",
+                "date_created": scheduled,
+                "has_report": i < samples_to_generate * 0.7,
             })
-        
+
         return samples
 
     def count_recent_tests(
@@ -393,6 +441,12 @@ class LocalAPIClient(DataClientInterface):
             })
         
         return orders
+
+    def get_last_samples_total(self) -> Optional[int]:
+        return self._last_samples_total
+
+    def get_last_reports_total(self) -> Optional[int]:
+        return self._last_reports_total
 
     def fetch_customer_details(self, customer_id: Union[str, int]) -> Optional[Dict[str, Any]]:
         key = str(customer_id).strip()

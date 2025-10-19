@@ -65,6 +65,18 @@ class SummaryWorker(QObject):
                 start_date=self._start_date,
                 end_date=self._end_date,
             )
+            samples_total = len(samples)
+            total_getter = getattr(self._client, "get_last_samples_total", None)
+            if callable(total_getter):
+                try:
+                    reported_total = total_getter()
+                except Exception:  # pragma: no cover - defensive
+                    reported_total = None
+                if reported_total is not None:
+                    try:
+                        samples_total = int(reported_total)
+                    except (TypeError, ValueError):
+                        pass
             counts = {}
             for sample in samples:
                 created = sample.get("date_created")
@@ -88,6 +100,17 @@ class SummaryWorker(QObject):
                 if has_report and sid and sid not in report_seen:
                     report_seen.add(sid)
                     reports_total += 1
+            reports_getter = getattr(self._client, "get_last_reports_total", None)
+            if callable(reports_getter):
+                try:
+                    reported_reports = reports_getter()
+                except Exception:  # pragma: no cover - defensive
+                    reported_reports = None
+                if reported_reports is not None:
+                    try:
+                        reports_total = int(reported_reports)
+                    except (TypeError, ValueError):
+                        pass
             range_start = self._start_date
             range_end = self._end_date
             now_utc = datetime.now(timezone.utc)
@@ -197,7 +220,7 @@ class SummaryWorker(QObject):
                         if details and details.get("name"):
                             entry["name"] = details.get("name") or entry["id"]
             summary = build_summary(
-                samples_total=len(samples),
+                samples_total=samples_total,
                 samples_series=samples_series,
                 tests_total=tests_total,
                 tests_series=tests_series,
