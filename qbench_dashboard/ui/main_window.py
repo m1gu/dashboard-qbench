@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from concurrent.futures import ThreadPoolExecutor
 
@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QAbstractItemView,
     QCalendarWidget,
     QCheckBox,
+    QComboBox,
     QDateEdit,
     QFrame,
     QGridLayout,
@@ -53,11 +54,13 @@ class SummaryWorker(QObject):
         *,
         start_date: Optional[datetime] = None,
         end_date: Optional[datetime] = None,
+        timeframe: str = "daily",
     ) -> None:
         super().__init__()
         self._client = client
         self._start_date = start_date
         self._end_date = end_date
+        self._timeframe = timeframe if timeframe in {"daily", "weekly", "monthly"} else "daily"
 
     def process(self) -> None:
         try:
@@ -219,11 +222,18 @@ class SummaryWorker(QObject):
                         details = self._client.fetch_customer_details(entry["id"])
                         if details and details.get("name"):
                             entry["name"] = details.get("name") or entry["id"]
+            if tests_series is None:
+                tests_series = []
+            else:
+                tests_series = list(tests_series)
+            aggregated_samples_series = self._aggregate_time_series(samples_series, self._timeframe)
+            aggregated_tests_series = self._aggregate_time_series(tests_series, self._timeframe)
+
             summary = build_summary(
                 samples_total=samples_total,
-                samples_series=samples_series,
+                samples_series=aggregated_samples_series,
                 tests_total=tests_total,
-                tests_series=tests_series,
+                tests_series=aggregated_tests_series,
                 tests_tat_sum=tat_sum_seconds,
                 tests_tat_count=tat_count,
                 tests_tat_daily=tat_daily,
@@ -235,10 +245,50 @@ class SummaryWorker(QObject):
                 start_date=self._start_date,
                 end_date=self._end_date,
             )
+            summary["timeframe_mode"] = self._timeframe
         except Exception as exc:  # pylint: disable=broad-except
             self.error.emit(str(exc))
         else:
             self.finished.emit(summary)
+
+    @staticmethod
+    def _normalize_datetime(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    @classmethod
+    def _bucket_start(cls, instant: datetime, mode: str) -> datetime:
+        normalized = cls._normalize_datetime(instant)
+        if mode == "weekly":
+            base_date = normalized.date() - timedelta(days=normalized.weekday())
+            return datetime.combine(base_date, datetime.min.time(), tzinfo=timezone.utc)
+        if mode == "monthly":
+            base_date = normalized.date().replace(day=1)
+            return datetime.combine(base_date, datetime.min.time(), tzinfo=timezone.utc)
+        return datetime.combine(normalized.date(), datetime.min.time(), tzinfo=timezone.utc)
+
+    @classmethod
+    def _aggregate_time_series(
+        cls,
+        series: Sequence[Tuple[datetime, int]],
+        mode: str,
+    ) -> List[Tuple[datetime, int]]:
+        if mode not in {"weekly", "monthly"}:
+            normalized_series = [
+                (cls._normalize_datetime(dt_value), int(count))
+                for dt_value, count in series
+                if isinstance(dt_value, datetime)
+            ]
+            normalized_series.sort(key=lambda entry: entry[0])
+            return normalized_series
+        aggregates: Dict[datetime, int] = {}
+        for dt_value, count in series:
+            if not isinstance(dt_value, datetime):
+                continue
+            bucket = cls._bucket_start(dt_value, mode)
+            aggregates[bucket] = aggregates.get(bucket, 0) + int(count or 0)
+        return [(key, aggregates[key]) for key in sorted(aggregates.keys())]
 
 
 class MainWindow(QMainWindow):
@@ -273,6 +323,22 @@ class MainWindow(QMainWindow):
         self.start_date_edit = self._create_date_edit()
         self.end_date_edit = self._create_date_edit()
         self._initialize_default_range()
+
+        self._timeframe_mode = "daily"
+        self._current_timeframe_mode = "daily"
+        self._timeframe_manual_override = False
+
+        self._timeframe_combo = QComboBox()
+        self._timeframe_combo.setStyleSheet(
+            "padding: 8px 12px; font-size: 14px; background-color: #1E2A44; color: #E0E8FF; "
+            "border: 1px solid #1F3B73; border-radius: 6px;"
+        )
+        self._timeframe_combo.setMinimumWidth(140)
+        self._timeframe_combo.addItem("Daily", "daily")
+        self._timeframe_combo.addItem("Weekly", "weekly")
+        self._timeframe_combo.addItem("Monthly", "monthly")
+        self._timeframe_combo.setCurrentIndex(0)
+        self._timeframe_combo.currentIndexChanged.connect(self._on_timeframe_changed)
 
         self.refresh_button = QPushButton("Refresh")
         self.refresh_button.clicked.connect(self.refresh_data)
@@ -333,6 +399,10 @@ class MainWindow(QMainWindow):
         end_label.setStyleSheet("color: #B0BCD5; font-size: 14px;")
         controls_layout.addWidget(end_label)
         controls_layout.addWidget(self.end_date_edit)
+        timeframe_label = QLabel("Timeframe")
+        timeframe_label.setStyleSheet("color: #B0BCD5; font-size: 14px;")
+        controls_layout.addWidget(timeframe_label)
+        controls_layout.addWidget(self._timeframe_combo)
         controls_layout.addWidget(self.refresh_button)
         controls_layout.addStretch()
 
@@ -864,20 +934,53 @@ class MainWindow(QMainWindow):
         self.start_date_edit.setMaximumDate(today)
         self.start_date_edit.setDate(today.addDays(-6))
 
-    def refresh_data(self) -> None:
+    def _determine_timeframe_mode(self, start_dt: datetime, end_dt: datetime) -> str:
+        try:
+            start_date = start_dt.date()
+            end_date = end_dt.date()
+        except AttributeError:
+            return "daily"
+        days = max(1, (end_date - start_date).days + 1)
+        if days <= 14:
+            return "daily"
+        if days <= 92:
+            return "weekly"
+        return "monthly"
+
+    def _set_timeframe_selection(self, mode: str, *, programmatic: bool = False) -> None:
+        normalized = mode if mode in {"daily", "weekly", "monthly"} else "daily"
+        if programmatic:
+            self._timeframe_combo.blockSignals(True)
+        index = self._timeframe_combo.findData(normalized)
+        if index >= 0:
+            self._timeframe_combo.setCurrentIndex(index)
+        if programmatic:
+            self._timeframe_combo.blockSignals(False)
+        self._timeframe_mode = normalized
+
+    def _apply_default_timeframe(self, start_dt: datetime, end_dt: datetime) -> None:
+        recommended = self._determine_timeframe_mode(start_dt, end_dt)
+        self._timeframe_manual_override = False
+        self._set_timeframe_selection(recommended, programmatic=True)
+
+    def _get_timeframe_label(self, mode: Optional[str] = None) -> str:
+        target = mode or self._timeframe_mode
+        index = self._timeframe_combo.findData(target)
+        if index >= 0:
+            return self._timeframe_combo.itemText(index)
+        return (target or "Daily").title()
+
+    def _begin_data_fetch(self, start_dt: datetime, end_dt: datetime) -> None:
         if self._loading:
             return
-        try:
-            start_dt, end_dt = self._get_selected_range()
-        except ValueError as exc:
-            self._show_error(str(exc))
-            return
-
         self._set_loading(True)
         status_message = "Updating..."
         range_text = self._format_range(start_dt, end_dt)
         if range_text:
             status_message += f" Range: {range_text}"
+        timeframe_label = self._get_timeframe_label()
+        if timeframe_label:
+            status_message += f" | Timeframe: {timeframe_label}"
         self._update_status(status_message)
 
         self._thread = QThread(self)
@@ -885,6 +988,7 @@ class MainWindow(QMainWindow):
             self._client,
             start_date=start_dt,
             end_date=end_dt,
+            timeframe=self._timeframe_mode,
         )
         self._worker.moveToThread(self._thread)
         self._thread.started.connect(self._worker.process)
@@ -897,6 +1001,39 @@ class MainWindow(QMainWindow):
         self._worker.error.connect(self._on_worker_error)
         self._thread.finished.connect(self._on_thread_finished)
         self._thread.start()
+
+    def refresh_data(self) -> None:
+        if self._loading:
+            return
+        try:
+            start_dt, end_dt = self._get_selected_range()
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+
+        self._apply_default_timeframe(start_dt, end_dt)
+        self._begin_data_fetch(start_dt, end_dt)
+
+    def _restart_with_current_range(self) -> None:
+        if self._loading:
+            return
+        try:
+            start_dt, end_dt = self._get_selected_range()
+        except ValueError as exc:
+            self._show_error(str(exc))
+            return
+        self._begin_data_fetch(start_dt, end_dt)
+
+    def _on_timeframe_changed(self, index: int) -> None:
+        mode = self._timeframe_combo.itemData(index)
+        if mode not in {"daily", "weekly", "monthly"}:
+            return
+        previous = self._timeframe_mode
+        self._timeframe_mode = mode
+        if mode == previous and self._timeframe_manual_override:
+            return
+        self._timeframe_manual_override = True
+        self._restart_with_current_range()
 
     def _on_worker_finished(self, summary: Dict[str, object]) -> None:
         self._apply_summary(summary)
@@ -950,48 +1087,65 @@ class MainWindow(QMainWindow):
         previous_list = tat_previous if isinstance(tat_previous, list) else []
         self._update_tat_chart(daily_list, previous_list)
 
+        timeframe_value = summary.get("timeframe_mode")
+        if isinstance(timeframe_value, str):
+            self._current_timeframe_mode = timeframe_value
+        else:
+            self._current_timeframe_mode = self._timeframe_mode
+
         range_text = self._format_range(start_dt, end_dt)
         now = datetime.now(timezone.utc)
         status_parts = [f"Last update: {now.strftime('%Y-%m-%d %H:%M:%S UTC')}"]
         if range_text:
             status_parts.append(f"Range: {range_text}")
+        timeframe_label = self._get_timeframe_label(self._current_timeframe_mode)
+        if timeframe_label:
+            status_parts.append(f"Timeframe: {timeframe_label}")
         self._update_status(" | ".join(status_parts))
 
         samples_series = summary.get("samples_series") or []
         tests_series = summary.get("tests_series") or []
 
-        daily_counts = {}
+        bucket_counts: Dict[datetime, List[int]] = {}
         for dt_value, count in samples_series:
-            if isinstance(dt_value, datetime):
-                day = dt_value.date()
-                daily_counts.setdefault(day, [0, 0])[0] = int(count)
+            normalized = self._ensure_utc_datetime(dt_value)
+            if not normalized:
+                continue
+            bucket_counts.setdefault(normalized, [0, 0])[0] = int(count)
         for dt_value, count in tests_series:
-            if isinstance(dt_value, datetime):
-                day = dt_value.date()
-                daily_counts.setdefault(day, [0, 0])[1] = int(count)
+            normalized = self._ensure_utc_datetime(dt_value)
+            if not normalized:
+                continue
+            bucket_counts.setdefault(normalized, [0, 0])[1] = int(count)
 
         self.samples_set.remove(0, self.samples_set.count())
         self.tests_set.remove(0, self.tests_set.count())
 
-        sorted_days = sorted(daily_counts.keys())
+        sorted_buckets = sorted(bucket_counts.keys())
         category_labels = []
         max_value = 1
-        for day in sorted_days:
-            sample_count, test_count = daily_counts[day]
-            category_labels.append(day.strftime('%b %d'))
+        for bucket in sorted_buckets:
+            sample_count, test_count = bucket_counts[bucket]
+            category_labels.append(self._format_category_label(bucket, self._current_timeframe_mode))
             self.samples_set.append(float(sample_count))
             self.tests_set.append(float(test_count))
             max_value = max(max_value, sample_count, test_count)
 
         if not category_labels:
             reference = datetime.now(timezone.utc)
-            category_labels = [reference.strftime('%b %d')]
+            category_labels = [self._format_category_label(reference, self._current_timeframe_mode)]
             self.samples_set.append(0.0)
             self.tests_set.append(0.0)
             max_value = 1
 
         self.categories_axis.clear()
         self.categories_axis.append(category_labels)
+        axis_title = {
+            "daily": "Fecha",
+            "weekly": "Semana",
+            "monthly": "Mes",
+        }.get(self._current_timeframe_mode, "Fecha")
+        self.categories_axis.setTitleText(axis_title)
         self.bar_series.setBarWidth(0.4)
         self.value_axis.setRange(0, max_value + 1)
 
@@ -1007,6 +1161,20 @@ class MainWindow(QMainWindow):
         label = bar_set.label() or ""
         category = categories[index]
         QToolTip.showText(QCursor.pos(), f"{label}: {value} ({category})", self.chart_view)
+
+    @staticmethod
+    def _ensure_utc_datetime(value: Any) -> Optional[datetime]:
+        if isinstance(value, datetime):
+            return value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        return None
+
+    def _format_category_label(self, instant: datetime, mode: str) -> str:
+        normalized = self._ensure_utc_datetime(instant) or datetime.now(timezone.utc)
+        if mode == "monthly":
+            return normalized.strftime("%b %Y")
+        if mode == "weekly":
+            return f"Wk of {normalized.strftime('%b %d')}"
+        return normalized.strftime("%b %d")
 
     def _get_selected_range(self) -> Tuple[datetime, datetime]:
         start_qdate = self.start_date_edit.date()
@@ -1056,6 +1224,7 @@ class MainWindow(QMainWindow):
         self.refresh_button.setEnabled(not loading)
         self.start_date_edit.setEnabled(not loading)
         self.end_date_edit.setEnabled(not loading)
+        self._timeframe_combo.setEnabled(not loading)
         if loading:
             self._spinner_index = 0
             self.spinner_label.setText(self._spinner_frames[self._spinner_index])
