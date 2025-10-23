@@ -1088,15 +1088,14 @@ class MainWindow(QMainWindow):
         self.test_types_set.hovered.connect(lambda status, index: self._on_test_type_bar_hover(status, index))
         self.test_types_series.append(self.test_types_set)
 
-        try:
+        attached_axes = {axis for axis in self.test_types_series.attachedAxes()}
+        if axis_values not in attached_axes:
+            if axis_values not in chart.axes():
+                chart.addAxis(axis_values, Qt.AlignBottom)
             self.test_types_series.attachAxis(axis_values)
-        except RuntimeError:
-            chart.addAxis(axis_values, Qt.AlignBottom)
-            self.test_types_series.attachAxis(axis_values)
-        try:
-            self.test_types_series.attachAxis(axis_categories)
-        except RuntimeError:
-            chart.addAxis(axis_categories, Qt.AlignLeft)
+        if axis_categories not in attached_axes:
+            if axis_categories not in chart.axes():
+                chart.addAxis(axis_categories, Qt.AlignLeft)
             self.test_types_series.attachAxis(axis_categories)
 
         axis_categories.clear()
