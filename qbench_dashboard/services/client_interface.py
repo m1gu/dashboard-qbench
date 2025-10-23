@@ -85,3 +85,45 @@ class DataClientInterface(ABC):
     def fetch_customer_details(self, customer_id: Union[str, int]) -> Optional[Dict[str, Any]]:
         """Fetch details for a specific customer."""
         pass
+
+    @abstractmethod
+    def fetch_order_throughput(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        interval: str = "week",
+    ) -> Dict[str, Any]:
+        """Fetch throughput analytics for orders within the given range."""
+        pass
+
+    @abstractmethod
+    def fetch_sample_cycle_time(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        interval: str = "day",
+    ) -> Dict[str, Any]:
+        """Fetch cycle-time analytics for completed samples."""
+        pass
+
+    @abstractmethod
+    def fetch_order_funnel(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        """Fetch funnel analytics that shows counts per stage."""
+        pass
+
+    @abstractmethod
+    def fetch_slowest_orders(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        """Fetch or derive the slowest orders for the given date range."""
+        pass

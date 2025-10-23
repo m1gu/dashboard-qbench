@@ -558,3 +558,324 @@ class LocalAPIClient(DataClientInterface):
         }
         self._customer_cache[key] = record
         return record
+
+    def fetch_order_throughput(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        interval: str = "week",
+    ) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+
+        def _normalize(value: Optional[Union[datetime, date]], *, pad_end: bool) -> Optional[datetime]:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                dt_value = value
+            elif isinstance(value, date):
+                dt_value = datetime.combine(value, datetime.max.time() if pad_end else datetime.min.time())
+            else:
+                raise TypeError(f"Unsupported date value: {type(value)!r}")
+            if dt_value.tzinfo is None:
+                dt_value = dt_value.replace(tzinfo=timezone.utc)
+            else:
+                dt_value = dt_value.astimezone(timezone.utc)
+            return dt_value
+
+        end_dt = _normalize(end_date, pad_end=True) or now
+        start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=28)
+        if end_dt < start_dt:
+            raise ValueError("Start date must be before or equal to end date.")
+
+        params = {
+            "date_from": start_dt.isoformat(),
+            "date_to": end_dt.isoformat(),
+            "interval": interval,
+        }
+        payload = self._request(self.session.get, "analytics/orders/throughput", params=params)
+
+        def _parse_period(value: Any) -> Optional[datetime]:
+            if not isinstance(value, str):
+                return None
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed
+
+        points: List[Dict[str, Any]] = []
+        for item in payload.get("points", []):
+            if not isinstance(item, dict):
+                continue
+            period_dt = _parse_period(item.get("period_start"))
+            points.append({
+                "period_start": period_dt,
+                "orders_created": int(item.get("orders_created") or 0),
+                "orders_completed": int(item.get("orders_completed") or 0),
+                "average_completion_hours": float(item.get("average_completion_hours") or 0.0),
+                "median_completion_hours": float(item.get("median_completion_hours") or 0.0),
+            })
+
+        totals_payload = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
+        totals = {
+            "orders_created": int(totals_payload.get("orders_created") or 0),
+            "orders_completed": int(totals_payload.get("orders_completed") or 0),
+            "average_completion_hours": float(totals_payload.get("average_completion_hours") or 0.0),
+            "median_completion_hours": float(totals_payload.get("median_completion_hours") or 0.0),
+        }
+        return {
+            "interval": payload.get("interval") or interval,
+            "points": points,
+            "totals": totals,
+        }
+
+    def fetch_sample_cycle_time(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        interval: str = "day",
+    ) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+
+        def _normalize(value: Optional[Union[datetime, date]], *, pad_end: bool) -> Optional[datetime]:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                dt_value = value
+            elif isinstance(value, date):
+                dt_value = datetime.combine(value, datetime.max.time() if pad_end else datetime.min.time())
+            else:
+                raise TypeError(f"Unsupported date value: {type(value)!r}")
+            if dt_value.tzinfo is None:
+                dt_value = dt_value.replace(tzinfo=timezone.utc)
+            else:
+                dt_value = dt_value.astimezone(timezone.utc)
+            return dt_value
+
+        end_dt = _normalize(end_date, pad_end=True) or now
+        start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=7)
+        if end_dt < start_dt:
+            raise ValueError("Start date must be before or equal to end date.")
+
+        params = {
+            "date_from": start_dt.isoformat(),
+            "date_to": end_dt.isoformat(),
+            "interval": interval,
+        }
+        payload = self._request(self.session.get, "analytics/samples/cycle-time", params=params)
+
+        def _parse_period(value: Any) -> Optional[datetime]:
+            if not isinstance(value, str):
+                return None
+            try:
+                parsed = datetime.fromisoformat(value)
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            else:
+                parsed = parsed.astimezone(timezone.utc)
+            return parsed
+
+        points: List[Dict[str, Any]] = []
+        for item in payload.get("points", []):
+            if not isinstance(item, dict):
+                continue
+            period_dt = _parse_period(item.get("period_start"))
+            points.append({
+                "period_start": period_dt,
+                "completed_samples": int(item.get("completed_samples") or 0),
+                "average_cycle_hours": float(item.get("average_cycle_hours") or 0.0),
+                "median_cycle_hours": float(item.get("median_cycle_hours") or 0.0),
+            })
+
+        totals_payload = payload.get("totals") if isinstance(payload.get("totals"), dict) else {}
+        totals = {
+            "completed_samples": int(totals_payload.get("completed_samples") or 0),
+            "average_cycle_hours": float(totals_payload.get("average_cycle_hours") or 0.0),
+            "median_cycle_hours": float(totals_payload.get("median_cycle_hours") or 0.0),
+        }
+
+        by_matrix: List[Dict[str, Any]] = []
+        for item in payload.get("by_matrix_type", []):
+            if not isinstance(item, dict):
+                continue
+            by_matrix.append({
+                "matrix_type": item.get("matrix_type") or "Unknown",
+                "completed_samples": int(item.get("completed_samples") or 0),
+                "average_cycle_hours": float(item.get("average_cycle_hours") or 0.0),
+            })
+
+        return {
+            "interval": payload.get("interval") or interval,
+            "points": points,
+            "totals": totals,
+            "by_matrix_type": by_matrix,
+        }
+
+    def fetch_order_funnel(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+
+        def _normalize(value: Optional[Union[datetime, date]], *, pad_end: bool) -> Optional[datetime]:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                dt_value = value
+            elif isinstance(value, date):
+                dt_value = datetime.combine(value, datetime.max.time() if pad_end else datetime.min.time())
+            else:
+                raise TypeError(f"Unsupported date value: {type(value)!r}")
+            if dt_value.tzinfo is None:
+                dt_value = dt_value.replace(tzinfo=timezone.utc)
+            else:
+                dt_value = dt_value.astimezone(timezone.utc)
+            return dt_value
+
+        end_dt = _normalize(end_date, pad_end=True) or now
+        start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=28)
+        if end_dt < start_dt:
+            raise ValueError("Start date must be before or equal to end date.")
+
+        params = {
+            "date_from": start_dt.isoformat(),
+            "date_to": end_dt.isoformat(),
+        }
+        payload = self._request(self.session.get, "analytics/orders/funnel", params=params)
+
+        stages: List[Dict[str, Any]] = []
+        for item in payload.get("stages", []):
+            if not isinstance(item, dict):
+                continue
+            stages.append({
+                "stage": str(item.get("stage") or "").strip() or "unknown",
+                "count": int(item.get("count") or 0),
+            })
+        return {
+            "total_orders": int(payload.get("total_orders") or 0),
+            "stages": stages,
+        }
+
+    def fetch_slowest_orders(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+
+        def _normalize(value: Optional[Union[datetime, date]], *, pad_end: bool) -> Optional[datetime]:
+            if value is None:
+                return None
+            if isinstance(value, datetime):
+                dt_value = value
+            elif isinstance(value, date):
+                dt_value = datetime.combine(value, datetime.max.time() if pad_end else datetime.min.time())
+            else:
+                raise TypeError(f"Unsupported date value: {type(value)!r}")
+            if dt_value.tzinfo is None:
+                dt_value = dt_value.replace(tzinfo=timezone.utc)
+            else:
+                dt_value = dt_value.astimezone(timezone.utc)
+            return dt_value
+
+        end_dt = _normalize(end_date, pad_end=True) or now
+        start_dt = _normalize(start_date, pad_end=False) or end_dt - timedelta(days=28)
+        if end_dt < start_dt:
+            raise ValueError("Start date must be before or equal to end date.")
+
+        params = {
+            "date_from": start_dt.isoformat(),
+            "date_to": end_dt.isoformat(),
+            "limit": limit,
+        }
+        payload: Optional[Dict[str, Any]]
+        try:
+            payload = self._request(self.session.get, "analytics/orders/slowest", params=params)
+        except LocalAPIError:
+            payload = None
+
+        orders: List[Dict[str, Any]] = []
+        if isinstance(payload, dict):
+            source: Optional[Sequence[Any]] = None
+            if isinstance(payload.get("items"), list):
+                source = payload.get("items")  # type: ignore[assignment]
+            elif isinstance(payload.get("orders"), list):
+                source = payload.get("orders")  # type: ignore[assignment]
+            elif isinstance(payload.get("data"), list):
+                source = payload.get("data")  # type: ignore[assignment]
+
+            if isinstance(source, list):
+                def _parse_dt(value: Any) -> Optional[datetime]:
+                    if not isinstance(value, str):
+                        return None
+                    try:
+                        parsed = datetime.fromisoformat(value)
+                    except ValueError:
+                        return None
+                    if parsed.tzinfo is None:
+                        return parsed.replace(tzinfo=timezone.utc)
+                    return parsed.astimezone(timezone.utc)
+
+                for item in source[:limit]:
+                    if not isinstance(item, dict):
+                        continue
+                    completion_hours = item.get("completion_hours")
+                    try:
+                        completion_value = float(completion_hours) if completion_hours is not None else None
+                    except (TypeError, ValueError):
+                        completion_value = None
+                    age_hours = item.get("age_hours")
+                    try:
+                        age_value = float(age_hours) if age_hours is not None else None
+                    except (TypeError, ValueError):
+                        age_value = None
+
+                    orders.append({
+                        "order_id": item.get("order_id") or item.get("id") or "",
+                        "order_reference": item.get("order_reference") or "",
+                        "customer_name": item.get("customer_name") or item.get("customer") or "",
+                        "status": item.get("state") or item.get("status") or "",
+                        "completion_hours": completion_value,
+                        "age_hours": age_value,
+                        "date_created": _parse_dt(item.get("date_created")),
+                        "date_completed": _parse_dt(item.get("date_completed")),
+                    })
+
+        if orders:
+            return orders[:limit]
+
+        # Fallback: derive pseudo-entries from throughput data when slowest endpoint is unavailable.
+        throughput = self.fetch_order_throughput(
+            start_date=start_dt,
+            end_date=end_dt,
+            interval="week",
+        )
+        points = throughput.get("points", [])
+        points_sorted = sorted(
+            [item for item in points if isinstance(item, dict)],
+            key=lambda entry: float(entry.get("average_completion_hours") or 0.0),
+            reverse=True,
+        )
+        derived: List[Dict[str, Any]] = []
+        for item in points_sorted[:limit]:
+            period_dt = item.get("period_start")
+            label = period_dt.strftime("%Y-%m-%d") if isinstance(period_dt, datetime) else str(period_dt)
+            derived.append({
+                "order_id": f"bucket-{label}",
+                "customer_name": "Aggregate",
+                "status": "completed",
+                "completion_hours": float(item.get("average_completion_hours") or 0.0),
+                "age_hours": float(item.get("median_completion_hours") or 0.0),
+            })
+        return derived

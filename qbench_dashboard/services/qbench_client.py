@@ -624,6 +624,40 @@ class QBenchClient(DataClientInterface):
         self._customer_cache[key] = record
         return record
 
+    def fetch_order_throughput(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        interval: str = "week",
+    ) -> Dict[str, Any]:
+        raise QBenchError("Operational efficiency analytics are not supported for QBench provider.")
+
+    def fetch_sample_cycle_time(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        interval: str = "day",
+    ) -> Dict[str, Any]:
+        raise QBenchError("Operational efficiency analytics are not supported for QBench provider.")
+
+    def fetch_order_funnel(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+    ) -> Dict[str, Any]:
+        raise QBenchError("Operational efficiency analytics are not supported for QBench provider.")
+
+    def fetch_slowest_orders(
+        self,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        *,
+        limit: int = 10,
+    ) -> List[Dict[str, Any]]:
+        raise QBenchError("Operational efficiency analytics are not supported for QBench provider.")
+
     def _extract_samples(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         data = payload.get("data")
         if not data:

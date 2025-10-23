@@ -33,6 +33,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QTabWidget,
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
@@ -294,6 +295,147 @@ class SummaryWorker(QObject):
         return [(key, aggregates[key]) for key in sorted(aggregates.keys())]
 
 
+class OperationalWorker(QObject):
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        client: DataClientInterface,
+        *,
+        start_date: Optional[datetime] = None,
+        end_date: Optional[datetime] = None,
+        timeframe: str = "week",
+        order_limit: int = 15,
+    ) -> None:
+        super().__init__()
+        self._client = client
+        self._start_date = start_date
+        self._end_date = end_date
+        self._timeframe = timeframe if timeframe in {"day", "week", "month"} else "week"
+        self._order_limit = max(1, int(order_limit))
+
+    @staticmethod
+    def _normalize_datetime(value: datetime) -> datetime:
+        if value.tzinfo is None:
+            return value.replace(tzinfo=timezone.utc)
+        return value.astimezone(timezone.utc)
+
+    def process(self) -> None:
+        try:
+            throughput = self._client.fetch_order_throughput(
+                start_date=self._start_date,
+                end_date=self._end_date,
+                interval=self._timeframe,
+            )
+            cycle_time = self._client.fetch_sample_cycle_time(
+                start_date=self._start_date,
+                end_date=self._end_date,
+                interval="day" if self._timeframe == "day" else self._timeframe,
+            )
+            funnel = self._client.fetch_order_funnel(
+                start_date=self._start_date,
+                end_date=self._end_date,
+            )
+            slow_orders = self._client.fetch_slowest_orders(
+                start_date=self._start_date,
+                end_date=self._end_date,
+                limit=self._order_limit,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            self.error.emit(str(exc))
+            return
+
+        throughput_points: List[Dict[str, Any]] = []
+        for entry in throughput.get("points", []):
+            if not isinstance(entry, dict):
+                continue
+            period = entry.get("period_start")
+            if isinstance(period, datetime):
+                normalized = self._normalize_datetime(period)
+            else:
+                normalized = None
+            throughput_points.append({
+                "period_start": normalized,
+                "orders_created": int(entry.get("orders_created") or 0),
+                "orders_completed": int(entry.get("orders_completed") or 0),
+                "average_completion_hours": float(entry.get("average_completion_hours") or 0.0),
+                "median_completion_hours": float(entry.get("median_completion_hours") or 0.0),
+            })
+
+        cycle_points: List[Dict[str, Any]] = []
+        for entry in cycle_time.get("points", []):
+            if not isinstance(entry, dict):
+                continue
+            period = entry.get("period_start")
+            if isinstance(period, datetime):
+                normalized = self._normalize_datetime(period)
+            else:
+                normalized = None
+            cycle_points.append({
+                "period_start": normalized,
+                "completed_samples": int(entry.get("completed_samples") or 0),
+                "average_cycle_hours": float(entry.get("average_cycle_hours") or 0.0),
+                "median_cycle_hours": float(entry.get("median_cycle_hours") or 0.0),
+            })
+
+        matrix_breakdown: List[Dict[str, Any]] = []
+        for entry in cycle_time.get("by_matrix_type", []):
+            if not isinstance(entry, dict):
+                continue
+            matrix_breakdown.append({
+                "matrix_type": entry.get("matrix_type") or "Unknown",
+                "completed_samples": int(entry.get("completed_samples") or 0),
+                "average_cycle_hours": float(entry.get("average_cycle_hours") or 0.0),
+            })
+
+        funnel_stages: List[Dict[str, Any]] = []
+        for entry in funnel.get("stages", []):
+            if not isinstance(entry, dict):
+                continue
+            funnel_stages.append({
+                "stage": entry.get("stage") or "unknown",
+                "count": int(entry.get("count") or 0),
+            })
+
+        slowest_orders: List[Dict[str, Any]] = []
+        for entry in slow_orders:
+            if not isinstance(entry, dict):
+                continue
+            slowest_orders.append({
+                "order_id": entry.get("order_id") or entry.get("id") or "",
+                "customer_name": entry.get("customer_name") or entry.get("customer") or "",
+                "status": entry.get("status") or "",
+                "completion_hours": float(entry.get("completion_hours") or 0.0),
+                "age_hours": float(entry.get("age_hours") or 0.0),
+            })
+
+        totals = throughput.get("totals") if isinstance(throughput.get("totals"), dict) else {}
+        cycle_totals = cycle_time.get("totals") if isinstance(cycle_time.get("totals"), dict) else {}
+
+        summary = {
+            "start_date": self._start_date if isinstance(self._start_date, datetime) else None,
+            "end_date": self._end_date if isinstance(self._end_date, datetime) else None,
+            "timeframe": self._timeframe,
+            "metrics": {
+                "orders_completed": int(totals.get("orders_completed") or 0),
+                "orders_created": int(totals.get("orders_created") or 0),
+                "lead_time_average_hours": float(totals.get("average_completion_hours") or 0.0),
+                "lead_time_median_hours": float(totals.get("median_completion_hours") or 0.0),
+                "samples_completed": int(cycle_totals.get("completed_samples") or 0),
+                "sample_cycle_average_hours": float(cycle_totals.get("average_cycle_hours") or 0.0),
+                "sample_cycle_median_hours": float(cycle_totals.get("median_cycle_hours") or 0.0),
+            },
+            "throughput_points": throughput_points,
+            "cycle_points": cycle_points,
+            "cycle_by_matrix": matrix_breakdown,
+            "funnel_total": int(funnel.get("total_orders") or 0),
+            "funnel_stages": funnel_stages,
+            "slowest_orders": slowest_orders,
+        }
+        self.finished.emit(summary)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, client: DataClientInterface) -> None:
         super().__init__()
@@ -301,6 +443,10 @@ class MainWindow(QMainWindow):
         self._thread: Optional[QThread] = None
         self._worker: Optional[SummaryWorker] = None
         self._loading = False
+        self._operational_thread: Optional[QThread] = None
+        self._operational_worker: Optional[OperationalWorker] = None
+        self._operational_loading = False
+        self._operational_initialized = False
         self._tat_target_seconds = 48 * 3600  # 48-hour SLA target by default
         self._tat_moving_average_window = 7
         self._tat_tooltip_data: Dict[int, Tuple[datetime, float, int]] = {}
@@ -331,6 +477,8 @@ class MainWindow(QMainWindow):
         self._timeframe_mode = "daily"
         self._current_timeframe_mode = "daily"
         self._timeframe_manual_override = False
+        self._operational_timeframe_mode = "week"
+        self._operational_current_timeframe_mode = "week"
 
         self._timeframe_combo = QComboBox()
         self._timeframe_combo.setStyleSheet(
@@ -463,14 +611,26 @@ class MainWindow(QMainWindow):
         scroll_area.setStyleSheet("QScrollArea { background-color: #0F172A; }")
         scroll_area.setWidget(content_widget)
 
-        container = QWidget()
-        container.setStyleSheet("background-color: #0F172A;")
-        container_layout = QVBoxLayout(container)
-        container_layout.setContentsMargins(0, 0, 0, 0)
-        container_layout.setSpacing(0)
-        container_layout.addWidget(scroll_area)
+        overview_container = QWidget()
+        overview_container.setStyleSheet("background-color: #0F172A;")
+        overview_layout = QVBoxLayout(overview_container)
+        overview_layout.setContentsMargins(0, 0, 0, 0)
+        overview_layout.setSpacing(0)
+        overview_layout.addWidget(scroll_area)
 
-        self.setCentralWidget(container)
+        self.tabs = QTabWidget()
+        self.tabs.setDocumentMode(True)
+        self.tabs.setStyleSheet(
+            "QTabWidget::pane { border: 0; } "
+            "QTabBar::tab { background-color: #111C34; color: #B0BCD5; padding: 10px 18px; border-radius: 8px; } "
+            "QTabBar::tab:selected { background-color: #1F3B73; color: white; }"
+        )
+        self.tabs.addTab(overview_container, "Overview")
+        operational_tab = self._build_operational_tab()
+        self._operational_tab_index = self.tabs.addTab(operational_tab, "Operational Efficiency")
+        self.tabs.currentChanged.connect(self._on_tab_changed)
+
+        self.setCentralWidget(self.tabs)
 
     def _init_bottom_lists(self, parent_layout: QVBoxLayout) -> None:
         lists_layout = QHBoxLayout()
@@ -554,6 +714,20 @@ class MainWindow(QMainWindow):
         title_label.setStyleSheet("color: #E0E8FF; font-weight: 600; font-size: 14px;")
         layout.addWidget(title_label)
         layout.addWidget(content_widget)
+        return frame
+
+    def _create_chart_panel(self, title: str, chart_view: QChartView) -> QFrame:
+        frame = QFrame()
+        frame.setFrameShape(QFrame.StyledPanel)
+        frame.setStyleSheet("QFrame { background-color: #111C34; border: 1px solid #1F3B73; border-radius: 10px; }")
+        layout = QVBoxLayout(frame)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
+
+        title_label = QLabel(title)
+        title_label.setStyleSheet("color: #E0E8FF; font-weight: 600; font-size: 16px;")
+        layout.addWidget(title_label)
+        layout.addWidget(chart_view)
         return frame
 
     def _create_tat_panel(self) -> QFrame:
@@ -1410,6 +1584,572 @@ class MainWindow(QMainWindow):
         if not isinstance(start, datetime) or not isinstance(end, datetime):
             return ""
         return f"{start.strftime('%Y-%m-%d')} - {end.strftime('%Y-%m-%d')}"
+
+    def _build_operational_tab(self) -> QWidget:
+        tab = QWidget()
+        tab.setStyleSheet("background-color: #0F172A;")
+
+        content_widget = QWidget()
+        content_widget.setStyleSheet("background-color: #0F172A;")
+        content_layout = QVBoxLayout(content_widget)
+        content_layout.setContentsMargins(24, 24, 24, 24)
+        content_layout.setSpacing(20)
+
+        header_label = QLabel("Operational Efficiency")
+        header_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header_label.setStyleSheet("color: #E0E8FF; font-size: 26px; font-weight: 700;")
+        content_layout.addWidget(header_label)
+
+        self.op_spinner_label = QLabel("")
+        self.op_spinner_label.setAlignment(Qt.AlignCenter)
+        self.op_spinner_label.setStyleSheet("color: #7EE787; font-size: 14px;")
+        self.op_spinner_label.setVisible(False)
+
+        self.op_status_label = QLabel("Ready")
+        self.op_status_label.setAlignment(Qt.AlignCenter)
+        self.op_status_label.setStyleSheet("color: #B0BCD5;")
+
+        self._operational_spinner_frames = ["|", "/", "-", "\\"]
+        self._operational_spinner_index = 0
+        self._operational_spinner_timer = QTimer(self)
+        self._operational_spinner_timer.setInterval(120)
+        self._operational_spinner_timer.timeout.connect(self._advance_operational_spinner)
+
+        self.op_start_date_edit = self._create_date_edit()
+        self.op_end_date_edit = self._create_date_edit()
+        self._initialize_operational_range()
+
+        self._operational_timeframe_combo = QComboBox()
+        self._operational_timeframe_combo.setStyleSheet(
+            "padding: 8px 12px; font-size: 14px; background-color: #1E2A44; color: #E0E8FF; "
+            "border: 1px solid #1F3B73; border-radius: 6px;"
+        )
+        self._operational_timeframe_combo.setMinimumWidth(140)
+        self._operational_timeframe_combo.addItem("Daily", "day")
+        self._operational_timeframe_combo.addItem("Weekly", "week")
+        self._operational_timeframe_combo.addItem("Monthly", "month")
+        self._operational_timeframe_combo.setCurrentIndex(1)
+        self._operational_timeframe_combo.currentIndexChanged.connect(self._on_operational_timeframe_changed)
+        self._operational_timeframe_mode = self._operational_timeframe_combo.currentData()
+        self._operational_current_timeframe_mode = self._operational_timeframe_mode  # type: ignore[assignment]
+
+        self.op_refresh_button = QPushButton("Refresh")
+        self.op_refresh_button.clicked.connect(self.refresh_operational_data)
+        self.op_refresh_button.setFixedWidth(140)
+        self.op_refresh_button.setStyleSheet(
+            "padding: 12px; font-size: 16px; background-color: #1F3B73; color: white; border-radius: 6px;"
+        )
+
+        metrics_layout = QHBoxLayout()
+        metrics_layout.setSpacing(16)
+        self.op_lead_avg_card, self.op_lead_avg_value = self._create_metric_card("Avg Lead Time (h)", "#60CDF1")
+        self.op_lead_median_card, self.op_lead_median_value = self._create_metric_card("Median Lead Time (h)", "#9A7FF0")
+        self.op_orders_completed_card, self.op_orders_completed_value = self._create_metric_card("Orders Completed", "#7EE787")
+        self.op_samples_completed_card, self.op_samples_completed_value = self._create_metric_card("Samples Completed", "#F4B400")
+        for card in (
+            self.op_lead_avg_card,
+            self.op_lead_median_card,
+            self.op_orders_completed_card,
+            self.op_samples_completed_card,
+        ):
+            metrics_layout.addWidget(card, 1)
+        content_layout.addLayout(metrics_layout)
+
+        status_layout = QHBoxLayout()
+        status_layout.setContentsMargins(0, 0, 0, 0)
+        status_layout.setSpacing(6)
+        status_layout.setAlignment(Qt.AlignCenter)
+        status_layout.addWidget(self.op_spinner_label)
+        status_layout.addWidget(self.op_status_label)
+        content_layout.addLayout(status_layout)
+
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(12)
+        controls_layout.addStretch()
+        start_label = QLabel("From")
+        start_label.setStyleSheet("color: #B0BCD5; font-size: 14px;")
+        controls_layout.addWidget(start_label)
+        controls_layout.addWidget(self.op_start_date_edit)
+        end_label = QLabel("To")
+        end_label.setStyleSheet("color: #B0BCD5; font-size: 14px;")
+        controls_layout.addWidget(end_label)
+        controls_layout.addWidget(self.op_end_date_edit)
+        timeframe_label = QLabel("Interval")
+        timeframe_label.setStyleSheet("color: #B0BCD5; font-size: 14px;")
+        controls_layout.addWidget(timeframe_label)
+        controls_layout.addWidget(self._operational_timeframe_combo)
+        controls_layout.addWidget(self.op_refresh_button)
+        controls_layout.addStretch()
+        content_layout.addLayout(controls_layout)
+
+        self.op_throughput_chart = QChart()
+        self.op_throughput_chart.setBackgroundBrush(Qt.transparent)
+        throughput_legend = self.op_throughput_chart.legend()
+        throughput_legend.setVisible(True)
+        throughput_legend.setLabelBrush(QBrush(Qt.white))
+        throughput_legend.setBackgroundVisible(False)
+        self.op_throughput_created_set = QBarSet("Orders created")
+        self.op_throughput_created_set.setColor(QColor(0x4C, 0x6E, 0xF5))
+        self.op_throughput_completed_set = QBarSet("Orders completed")
+        self.op_throughput_completed_set.setColor(QColor(0x7E, 0xE7, 0x87))
+        self.op_throughput_bar_series = QBarSeries()
+        self.op_throughput_bar_series.append(self.op_throughput_created_set)
+        self.op_throughput_bar_series.append(self.op_throughput_completed_set)
+        self.op_throughput_chart.addSeries(self.op_throughput_bar_series)
+        self.op_throughput_avg_series = QLineSeries()
+        self.op_throughput_avg_series.setName("Avg completion (h)")
+        avg_pen = QPen(QColor("#FFB347"))
+        avg_pen.setWidth(2)
+        self.op_throughput_avg_series.setPen(avg_pen)
+        self.op_throughput_avg_series.setPointsVisible(True)
+        self.op_throughput_chart.addSeries(self.op_throughput_avg_series)
+        self.op_throughput_category_axis = QBarCategoryAxis()
+        self.op_throughput_category_axis.setLabelsColor(Qt.white)
+        self.op_throughput_chart.addAxis(self.op_throughput_category_axis, Qt.AlignBottom)
+        self.op_throughput_count_axis = QValueAxis()
+        self.op_throughput_count_axis.setLabelFormat("%d")
+        self.op_throughput_count_axis.setLabelsColor(Qt.white)
+        self.op_throughput_count_axis.setTitleText("Orders")
+        self.op_throughput_count_axis.setTitleBrush(Qt.white)
+        self.op_throughput_chart.addAxis(self.op_throughput_count_axis, Qt.AlignLeft)
+        self.op_throughput_bar_series.attachAxis(self.op_throughput_category_axis)
+        self.op_throughput_bar_series.attachAxis(self.op_throughput_count_axis)
+        self.op_throughput_hours_axis = QValueAxis()
+        self.op_throughput_hours_axis.setLabelFormat("%.1f")
+        self.op_throughput_hours_axis.setLabelsColor(Qt.white)
+        self.op_throughput_hours_axis.setTitleText("Hours")
+        self.op_throughput_hours_axis.setTitleBrush(Qt.white)
+        self.op_throughput_chart.addAxis(self.op_throughput_hours_axis, Qt.AlignRight)
+        self.op_throughput_avg_series.attachAxis(self.op_throughput_category_axis)
+        self.op_throughput_avg_series.attachAxis(self.op_throughput_hours_axis)
+        self.op_throughput_chart_view = QChartView(self.op_throughput_chart)
+        self.op_throughput_chart_view.setRenderHint(QPainter.Antialiasing, True)
+        self.op_throughput_chart_view.setMinimumHeight(340)
+        self.op_throughput_chart_view.setStyleSheet("background: rgba(32, 40, 62, 0.6);")
+
+        self.op_cycle_chart = QChart()
+        self.op_cycle_chart.setBackgroundBrush(Qt.transparent)
+        cycle_legend = self.op_cycle_chart.legend()
+        cycle_legend.setVisible(True)
+        cycle_legend.setLabelBrush(QBrush(Qt.white))
+        cycle_legend.setBackgroundVisible(False)
+        self.op_cycle_bar_set = QBarSet("Samples completed")
+        self.op_cycle_bar_set.setColor(QColor(0x3E, 0x9E, 0xBA))
+        self.op_cycle_bar_series = QBarSeries()
+        self.op_cycle_bar_series.append(self.op_cycle_bar_set)
+        self.op_cycle_chart.addSeries(self.op_cycle_bar_series)
+        self.op_cycle_avg_series = QLineSeries()
+        self.op_cycle_avg_series.setName("Avg cycle (h)")
+        cycle_pen = QPen(QColor("#E27D60"))
+        cycle_pen.setWidth(2)
+        self.op_cycle_avg_series.setPen(cycle_pen)
+        self.op_cycle_avg_series.setPointsVisible(True)
+        self.op_cycle_chart.addSeries(self.op_cycle_avg_series)
+        self.op_cycle_category_axis = QBarCategoryAxis()
+        self.op_cycle_category_axis.setLabelsColor(Qt.white)
+        self.op_cycle_chart.addAxis(self.op_cycle_category_axis, Qt.AlignBottom)
+        self.op_cycle_count_axis = QValueAxis()
+        self.op_cycle_count_axis.setLabelFormat("%d")
+        self.op_cycle_count_axis.setLabelsColor(Qt.white)
+        self.op_cycle_count_axis.setTitleText("Samples")
+        self.op_cycle_count_axis.setTitleBrush(Qt.white)
+        self.op_cycle_chart.addAxis(self.op_cycle_count_axis, Qt.AlignLeft)
+        self.op_cycle_bar_series.attachAxis(self.op_cycle_category_axis)
+        self.op_cycle_bar_series.attachAxis(self.op_cycle_count_axis)
+        self.op_cycle_hours_axis = QValueAxis()
+        self.op_cycle_hours_axis.setLabelFormat("%.1f")
+        self.op_cycle_hours_axis.setLabelsColor(Qt.white)
+        self.op_cycle_hours_axis.setTitleText("Hours")
+        self.op_cycle_hours_axis.setTitleBrush(Qt.white)
+        self.op_cycle_chart.addAxis(self.op_cycle_hours_axis, Qt.AlignRight)
+        self.op_cycle_avg_series.attachAxis(self.op_cycle_category_axis)
+        self.op_cycle_avg_series.attachAxis(self.op_cycle_hours_axis)
+        self.op_cycle_chart_view = QChartView(self.op_cycle_chart)
+        self.op_cycle_chart_view.setRenderHint(QPainter.Antialiasing, True)
+        self.op_cycle_chart_view.setMinimumHeight(340)
+        self.op_cycle_chart_view.setStyleSheet("background: rgba(32, 40, 62, 0.6);")
+
+        charts_row = QHBoxLayout()
+        charts_row.setSpacing(16)
+        throughput_panel = self._create_chart_panel("Order throughput & completion", self.op_throughput_chart_view)
+        cycle_panel = self._create_chart_panel("Sample cycle time", self.op_cycle_chart_view)
+        charts_row.addWidget(throughput_panel, 1)
+        charts_row.addWidget(cycle_panel, 1)
+        content_layout.addLayout(charts_row)
+
+        self.op_funnel_chart = QChart()
+        self.op_funnel_chart.setBackgroundBrush(Qt.transparent)
+        self.op_funnel_chart.legend().setVisible(False)
+        self.op_funnel_series = QHorizontalBarSeries()
+        self.op_funnel_set = QBarSet("Orders")
+        self.op_funnel_series.append(self.op_funnel_set)
+        self.op_funnel_chart.addSeries(self.op_funnel_series)
+        self.op_funnel_value_axis = QValueAxis()
+        self.op_funnel_value_axis.setLabelFormat("%d")
+        self.op_funnel_value_axis.setLabelsColor(Qt.white)
+        self.op_funnel_value_axis.setTitleText("Orders")
+        self.op_funnel_value_axis.setTitleBrush(Qt.white)
+        self.op_funnel_chart.addAxis(self.op_funnel_value_axis, Qt.AlignBottom)
+        self.op_funnel_series.attachAxis(self.op_funnel_value_axis)
+        self.op_funnel_categories_axis = QBarCategoryAxis()
+        self.op_funnel_categories_axis.setLabelsColor(Qt.white)
+        self.op_funnel_chart.addAxis(self.op_funnel_categories_axis, Qt.AlignLeft)
+        self.op_funnel_series.attachAxis(self.op_funnel_categories_axis)
+        self.op_funnel_chart_view = QChartView(self.op_funnel_chart)
+        self.op_funnel_chart_view.setRenderHint(QPainter.Antialiasing, True)
+        self.op_funnel_chart_view.setMinimumHeight(320)
+        self.op_funnel_chart_view.setStyleSheet("background: rgba(32, 40, 62, 0.6);")
+        funnel_panel = self._create_chart_panel("Order funnel", self.op_funnel_chart_view)
+
+        self.op_matrix_table = self._create_table_widget(["Matrix", "Samples", "Avg hours"])
+        self.op_matrix_table.setMinimumHeight(200)
+        matrix_panel = self._create_list_panel("Cycle time by matrix", self.op_matrix_table)
+
+        self.op_slowest_orders_table = self._create_table_widget(
+            ["Order ID", "Customer", "Completion (h)", "Age (h)", "Status"]
+        )
+        self.op_slowest_orders_table.setMinimumHeight(240)
+        slow_orders_panel = self._create_list_panel("Slowest orders", self.op_slowest_orders_table)
+
+        bottom_layout = QHBoxLayout()
+        bottom_layout.setSpacing(16)
+        bottom_layout.addWidget(funnel_panel, 1)
+        tables_layout = QVBoxLayout()
+        tables_layout.setSpacing(16)
+        tables_layout.addWidget(matrix_panel)
+        tables_layout.addWidget(slow_orders_panel)
+        bottom_layout.addLayout(tables_layout, 1)
+        content_layout.addLayout(bottom_layout)
+
+        content_layout.addStretch()
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setStyleSheet("QScrollArea { background-color: #0F172A; }")
+        scroll_area.setWidget(content_widget)
+
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.setSpacing(0)
+        tab_layout.addWidget(scroll_area)
+
+        return tab
+
+    def _initialize_operational_range(self) -> None:
+        today = QDate.currentDate()
+        self.op_end_date_edit.setDate(today)
+        self.op_start_date_edit.setDate(today.addDays(-27))
+
+    def _get_operational_range(self) -> Tuple[datetime, datetime]:
+        start_qdate = self.op_start_date_edit.date()
+        end_qdate = self.op_end_date_edit.date()
+        start_dt = datetime(
+            start_qdate.year(),
+            start_qdate.month(),
+            start_qdate.day(),
+            tzinfo=timezone.utc,
+        )
+        end_dt = datetime(
+            end_qdate.year(),
+            end_qdate.month(),
+            end_qdate.day(),
+            23,
+            59,
+            59,
+            999999,
+            tzinfo=timezone.utc,
+        )
+        if end_dt < start_dt:
+            raise ValueError("Start date cannot be after the end date.")
+        return start_dt, end_dt
+
+    def _advance_operational_spinner(self) -> None:
+        if not self.op_spinner_label.isVisible():
+            return
+        self._operational_spinner_index = (self._operational_spinner_index + 1) % len(self._operational_spinner_frames)
+        self.op_spinner_label.setText(self._operational_spinner_frames[self._operational_spinner_index])
+
+    def _set_operational_loading(self, loading: bool) -> None:
+        self._operational_loading = loading
+        self.op_refresh_button.setEnabled(not loading)
+        self.op_start_date_edit.setEnabled(not loading)
+        self.op_end_date_edit.setEnabled(not loading)
+        self._operational_timeframe_combo.setEnabled(not loading)
+        if loading:
+            self._operational_spinner_index = 0
+            self.op_spinner_label.setText(self._operational_spinner_frames[self._operational_spinner_index])
+            self.op_spinner_label.setVisible(True)
+            if not self._operational_spinner_timer.isActive():
+                self._operational_spinner_timer.start()
+        else:
+            if self._operational_spinner_timer.isActive():
+                self._operational_spinner_timer.stop()
+            self.op_spinner_label.setVisible(False)
+            self.op_spinner_label.setText("")
+
+    def _update_operational_status(self, message: str) -> None:
+        self.op_status_label.setText(message)
+
+    def _show_operational_error(self, message: str) -> None:
+        self._update_operational_status("Update failed")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("Operational efficiency")
+        box.setText(message)
+        box.exec()
+
+    def _begin_operational_fetch(self, start_dt: datetime, end_dt: datetime) -> None:
+        if self._operational_loading:
+            return
+        self._set_operational_loading(True)
+        status_parts = ["Updating..."]
+        range_text = self._format_range(start_dt, end_dt)
+        if range_text:
+            status_parts.append(f"Range: {range_text}")
+        timeframe_label = self._get_operational_timeframe_label()
+        if timeframe_label:
+            status_parts.append(f"Interval: {timeframe_label}")
+        self._update_operational_status(" | ".join(status_parts))
+
+        self._operational_thread = QThread(self)
+        self._operational_worker = OperationalWorker(
+            self._client,
+            start_date=start_dt,
+            end_date=end_dt,
+            timeframe=self._operational_timeframe_mode,
+        )
+        self._operational_worker.moveToThread(self._operational_thread)
+        self._operational_thread.started.connect(self._operational_worker.process)
+        self._operational_worker.finished.connect(self._operational_thread.quit)
+        self._operational_worker.error.connect(self._operational_thread.quit)
+        self._operational_thread.finished.connect(self._operational_thread.deleteLater)
+        self._operational_worker.finished.connect(self._operational_worker.deleteLater)
+        self._operational_worker.error.connect(self._operational_worker.deleteLater)
+        self._operational_worker.finished.connect(self._on_operational_finished)
+        self._operational_worker.error.connect(self._on_operational_error)
+        self._operational_thread.finished.connect(self._on_operational_thread_finished)
+        self._operational_thread.start()
+
+    def refresh_operational_data(self) -> None:
+        if self._operational_loading:
+            return
+        try:
+            start_dt, end_dt = self._get_operational_range()
+        except ValueError as exc:
+            self._show_operational_error(str(exc))
+            return
+        self._begin_operational_fetch(start_dt, end_dt)
+
+    def _on_operational_timeframe_changed(self, index: int) -> None:
+        mode = self._operational_timeframe_combo.itemData(index)
+        if mode not in {"day", "week", "month"}:
+            return
+        if mode == self._operational_timeframe_mode and self._operational_initialized:
+            return
+        self._operational_timeframe_mode = mode
+        if self.tabs.currentIndex() == self._operational_tab_index:
+            self.refresh_operational_data()
+
+    def _on_tab_changed(self, index: int) -> None:
+        if index == self._operational_tab_index and not self._operational_initialized:
+            self._operational_initialized = True
+            self.refresh_operational_data()
+
+    def _on_operational_finished(self, summary: Dict[str, Any]) -> None:
+        self._apply_operational_summary(summary)
+
+    def _on_operational_error(self, message: str) -> None:
+        self._show_operational_error(message)
+
+    def _on_operational_thread_finished(self) -> None:
+        self._set_operational_loading(False)
+        self._operational_worker = None
+        self._operational_thread = None
+
+    def _apply_operational_summary(self, summary: Dict[str, Any]) -> None:
+        metrics = summary.get("metrics", {})
+        self.op_lead_avg_value.setText(self._format_hours(metrics.get("lead_time_average_hours")))
+        self.op_lead_median_value.setText(self._format_hours(metrics.get("lead_time_median_hours")))
+        self.op_orders_completed_value.setText(self._format_number(metrics.get("orders_completed")))
+        samples_completed = metrics.get("samples_completed")
+        self.op_samples_completed_value.setText(self._format_number(samples_completed))
+
+        start_dt = summary.get("start_date")
+        end_dt = summary.get("end_date")
+        if isinstance(start_dt, datetime) and isinstance(end_dt, datetime):
+            range_text = self._format_range(start_dt, end_dt)
+        else:
+            range_text = ""
+        self._operational_current_timeframe_mode = summary.get("timeframe", self._operational_timeframe_mode)
+        status_parts = [f"Last update: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')}"]
+        if range_text:
+            status_parts.append(f"Range: {range_text}")
+        label = self._get_operational_timeframe_label(self._operational_current_timeframe_mode)
+        if label:
+            status_parts.append(f"Interval: {label}")
+        self._update_operational_status(" | ".join(status_parts))
+
+        throughput_points = summary.get("throughput_points", [])
+        self._update_throughput_chart(throughput_points)
+        cycle_points = summary.get("cycle_points", [])
+        self._update_cycle_chart(cycle_points)
+        matrix_breakdown = summary.get("cycle_by_matrix", [])
+        self._update_matrix_table(matrix_breakdown)
+        funnel_stages = summary.get("funnel_stages", [])
+        funnel_total = summary.get("funnel_total", 0)
+        self._update_funnel_chart(funnel_stages, funnel_total)
+        slow_orders = summary.get("slowest_orders", [])
+        self._update_slowest_orders_table(slow_orders)
+
+    @staticmethod
+    def _format_hours(value: Optional[float]) -> str:
+        try:
+            numeric = float(value)
+        except (TypeError, ValueError):
+            return "--"
+        if numeric <= 0.0:
+            return "--"
+        if numeric >= 100.0:
+            return f"{numeric:.0f} h"
+        return f"{numeric:.1f} h"
+
+    @staticmethod
+    def _format_number(value: Any) -> str:
+        try:
+            numeric = int(value)
+        except (TypeError, ValueError):
+            return "--"
+        return f"{numeric:,}"
+
+    def _get_operational_timeframe_label(self, mode: Optional[str] = None) -> str:
+        selected = mode or self._operational_timeframe_mode
+        return {
+            "day": "Daily",
+            "week": "Weekly",
+            "month": "Monthly",
+        }.get(selected, "")
+
+    def _format_operational_category(self, dt_value: Optional[datetime]) -> str:
+        if not isinstance(dt_value, datetime):
+            return ""
+        if self._operational_current_timeframe_mode == "month":
+            return dt_value.strftime("%b %Y")
+        if self._operational_current_timeframe_mode == "week":
+            return f"Wk of {dt_value.strftime('%b %d')}"
+        return dt_value.strftime("%b %d")
+
+    def _update_throughput_chart(self, points: Sequence[Dict[str, Any]]) -> None:
+        self.op_throughput_created_set.remove(0, self.op_throughput_created_set.count())
+        self.op_throughput_completed_set.remove(0, self.op_throughput_completed_set.count())
+        self.op_throughput_avg_series.clear()
+
+        categories: List[str] = []
+        max_orders = 1
+        max_hours = 1.0
+        for index, entry in enumerate(points):
+            period = entry.get("period_start")
+            label = self._format_operational_category(period)
+            categories.append(label or f"{index + 1}")
+            created = int(entry.get("orders_created") or 0)
+            completed = int(entry.get("orders_completed") or 0)
+            avg_hours = float(entry.get("average_completion_hours") or 0.0)
+            self.op_throughput_created_set.append(created)
+            self.op_throughput_completed_set.append(completed)
+            self.op_throughput_avg_series.append(index + 0.5, avg_hours)
+            max_orders = max(max_orders, created, completed)
+            max_hours = max(max_hours, avg_hours)
+
+        if not categories:
+            categories = ["--"]
+            self.op_throughput_created_set.append(0)
+            self.op_throughput_completed_set.append(0)
+            self.op_throughput_avg_series.append(0.5, 0.0)
+
+        self.op_throughput_category_axis.clear()
+        self.op_throughput_category_axis.append(categories)
+        self.op_throughput_count_axis.setRange(0, max_orders * 1.2)
+        self.op_throughput_hours_axis.setRange(0.0, max_hours * 1.2 if max_hours > 0 else 1.0)
+
+    def _update_cycle_chart(self, points: Sequence[Dict[str, Any]]) -> None:
+        self.op_cycle_bar_set.remove(0, self.op_cycle_bar_set.count())
+        self.op_cycle_avg_series.clear()
+
+        categories: List[str] = []
+        max_samples = 1
+        max_hours = 1.0
+        for index, entry in enumerate(points):
+            period = entry.get("period_start")
+            label = self._format_operational_category(period)
+            categories.append(label or f"{index + 1}")
+            samples_completed = int(entry.get("completed_samples") or 0)
+            avg_hours = float(entry.get("average_cycle_hours") or 0.0)
+            self.op_cycle_bar_set.append(samples_completed)
+            self.op_cycle_avg_series.append(index + 0.5, avg_hours)
+            max_samples = max(max_samples, samples_completed)
+            max_hours = max(max_hours, avg_hours)
+
+        if not categories:
+            categories = ["--"]
+            self.op_cycle_bar_set.append(0)
+            self.op_cycle_avg_series.append(0.5, 0.0)
+
+        self.op_cycle_category_axis.clear()
+        self.op_cycle_category_axis.append(categories)
+        self.op_cycle_count_axis.setRange(0, max_samples * 1.2)
+        self.op_cycle_hours_axis.setRange(0.0, max_hours * 1.2 if max_hours > 0 else 1.0)
+
+    def _update_matrix_table(self, records: Sequence[Dict[str, Any]]) -> None:
+        table = self.op_matrix_table
+        table.setRowCount(0)
+        for entry in records:
+            if not isinstance(entry, dict):
+                continue
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(str(entry.get("matrix_type") or "Unknown")))
+            table.setItem(row, 1, QTableWidgetItem(self._format_number(entry.get("completed_samples"))))
+            table.setItem(row, 2, QTableWidgetItem(self._format_hours(entry.get("average_cycle_hours"))))
+        table.resizeColumnsToContents()
+
+    def _update_funnel_chart(self, stages: Sequence[Dict[str, Any]], total_orders: Any) -> None:
+        self.op_funnel_set.remove(0, self.op_funnel_set.count())
+        categories: List[str] = []
+        max_count = max(int(total_orders or 0), 1)
+        for entry in stages:
+            if not isinstance(entry, dict):
+                continue
+            stage_name = str(entry.get("stage") or "unknown").replace("_", " ").title()
+            count = int(entry.get("count") or 0)
+            categories.append(stage_name)
+            self.op_funnel_set.append(count)
+            max_count = max(max_count, count)
+        if not categories:
+            categories = ["No data"]
+            self.op_funnel_set.append(0)
+        self.op_funnel_categories_axis.clear()
+        self.op_funnel_categories_axis.append(categories)
+        self.op_funnel_value_axis.setRange(0, max_count * 1.1)
+
+    def _update_slowest_orders_table(self, records: Sequence[Dict[str, Any]]) -> None:
+        table = self.op_slowest_orders_table
+        table.setRowCount(0)
+        for entry in records:
+            if not isinstance(entry, dict):
+                continue
+            row = table.rowCount()
+            table.insertRow(row)
+            order_display = entry.get("order_reference") or entry.get("order_id") or ""
+            table.setItem(row, 0, QTableWidgetItem(str(order_display)))
+            table.setItem(row, 1, QTableWidgetItem(str(entry.get("customer_name") or "")))
+            completion = self._format_hours(entry.get("completion_hours"))
+            age = self._format_hours(entry.get("age_hours"))
+            table.setItem(row, 2, QTableWidgetItem(completion))
+            table.setItem(row, 3, QTableWidgetItem(age))
+            status_raw = entry.get("status") or ""
+            status_text = str(status_raw).replace("_", " ").title()
+            table.setItem(row, 4, QTableWidgetItem(status_text))
+        table.resizeColumnsToContents()
 
     def _set_loading(self, loading: bool) -> None:
         self._loading = loading
