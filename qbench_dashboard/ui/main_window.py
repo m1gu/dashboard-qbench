@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
+    QSpinBox,
     QToolTip,
     QVBoxLayout,
     QWidget,
@@ -436,6 +437,43 @@ class OperationalWorker(QObject):
         self.finished.emit(summary)
 
 
+class PriorityOrdersWorker(QObject):
+    finished = Signal(dict)
+    error = Signal(str)
+
+    def __init__(
+        self,
+        client: DataClientInterface,
+        *,
+        date_from: datetime,
+        date_to: datetime,
+        min_days_overdue: int,
+        sla_hours: int,
+        top_limit: int,
+    ) -> None:
+        super().__init__()
+        self._client = client
+        self._date_from = date_from
+        self._date_to = date_to
+        self._min_days_overdue = min_days_overdue
+        self._sla_hours = sla_hours
+        self._top_limit = top_limit
+
+    def process(self) -> None:
+        try:
+            payload = self._client.fetch_overdue_orders(
+                date_from=self._date_from,
+                date_to=self._date_to,
+                min_days_overdue=self._min_days_overdue,
+                sla_hours=self._sla_hours,
+                top_limit=self._top_limit,
+            )
+        except Exception as exc:  # pylint: disable=broad-except
+            self.error.emit(str(exc))
+        else:
+            self.finished.emit(payload)
+
+
 class MainWindow(QMainWindow):
     def __init__(self, client: DataClientInterface) -> None:
         super().__init__()
@@ -451,6 +489,16 @@ class MainWindow(QMainWindow):
         self._tat_moving_average_window = 7
         self._tat_tooltip_data: Dict[int, Tuple[datetime, float, int]] = {}
         self._test_type_categories: List[str] = []
+        self._priority_thread: Optional[QThread] = None
+        self._priority_worker: Optional[PriorityOrdersWorker] = None
+        self._priority_loading = False
+        self._priority_initialized = False
+        self._priority_top_limit = 25
+        self._priority_min_days_default = 5
+        self._priority_sla_hours_default = 240
+        self._priority_last_payload: Optional[Dict[str, Any]] = None
+        self._priority_heatmap_periods: List[datetime] = []
+        self._priority_heatmap_customers: List[str] = []
 
         self.setWindowTitle("QBench Dashboard")
         self.resize(1280, 720)
@@ -628,6 +676,8 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(overview_container, "Overview")
         operational_tab = self._build_operational_tab()
         self._operational_tab_index = self.tabs.addTab(operational_tab, "Operational Efficiency")
+        priority_tab = self._build_priority_orders_tab()
+        self._priority_tab_index = self.tabs.addTab(priority_tab, "Priority Orders")
         self.tabs.currentChanged.connect(self._on_tab_changed)
 
         self.setCentralWidget(self.tabs)
@@ -1641,8 +1691,8 @@ class MainWindow(QMainWindow):
 
         metrics_layout = QHBoxLayout()
         metrics_layout.setSpacing(16)
-        self.op_lead_avg_card, self.op_lead_avg_value = self._create_metric_card("Avg Lead Time (h)", "#60CDF1")
-        self.op_lead_median_card, self.op_lead_median_value = self._create_metric_card("Median Lead Time (h)", "#9A7FF0")
+        self.op_lead_avg_card, self.op_lead_avg_value = self._create_metric_card("Avg Lead Time", "#60CDF1")
+        self.op_lead_median_card, self.op_lead_median_value = self._create_metric_card("Median Lead Time", "#9A7FF0")
         self.op_orders_completed_card, self.op_orders_completed_value = self._create_metric_card("Orders Completed", "#7EE787")
         self.op_samples_completed_card, self.op_samples_completed_value = self._create_metric_card("Samples Completed", "#F4B400")
         for card in (
@@ -1800,12 +1850,12 @@ class MainWindow(QMainWindow):
         self.op_funnel_chart_view.setStyleSheet("background: rgba(32, 40, 62, 0.6);")
         funnel_panel = self._create_chart_panel("Order funnel", self.op_funnel_chart_view)
 
-        self.op_matrix_table = self._create_table_widget(["Matrix", "Samples", "Avg hours"])
+        self.op_matrix_table = self._create_table_widget(["Matrix", "Samples", "Avg time"])
         self.op_matrix_table.setMinimumHeight(200)
         matrix_panel = self._create_list_panel("Cycle time by matrix", self.op_matrix_table)
 
         self.op_slowest_orders_table = self._create_table_widget(
-            ["Order ID", "Customer", "Completion (h)", "Age (h)", "Status"]
+            ["Order ID", "Customer", "Completion", "Age", "Status"]
         )
         self.op_slowest_orders_table.setMinimumHeight(240)
         slow_orders_panel = self._create_list_panel("Slowest orders", self.op_slowest_orders_table)
@@ -1835,6 +1885,171 @@ class MainWindow(QMainWindow):
 
         return tab
 
+    def _build_priority_orders_tab(self) -> QWidget:
+        tab = QWidget()
+        tab.setStyleSheet("background-color: #0F172A;")
+
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(18)
+
+        header_label = QLabel("Priority Orders")
+        header_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        header_label.setStyleSheet("color: #E0E8FF; font-size: 24px; font-weight: 700;")
+        layout.addWidget(header_label)
+
+        metrics_layout = QHBoxLayout()
+        metrics_layout.setSpacing(16)
+        self.priority_total_card, self.priority_total_value = self._create_metric_card("Overdue orders", "#FF8FAB")
+        self.priority_breach_card, self.priority_breach_value = self._create_metric_card("Beyond SLA", "#F97316")
+        metrics_layout.addWidget(self.priority_total_card, 1)
+        metrics_layout.addWidget(self.priority_breach_card, 1)
+        metrics_layout.addStretch()
+        layout.addLayout(metrics_layout)
+
+        controls_layout = QHBoxLayout()
+        controls_layout.setSpacing(12)
+        controls_layout.addStretch()
+
+        min_days_label = QLabel("Minimum days overdue")
+        min_days_label.setStyleSheet("color: #B0BCD5; font-size: 13px;")
+        self.priority_min_days_spin = QSpinBox()
+        self.priority_min_days_spin.setRange(0, 90)
+        self.priority_min_days_spin.setValue(self._priority_min_days_default)
+        self.priority_min_days_spin.setSingleStep(1)
+        self.priority_min_days_spin.setStyleSheet(
+            "QSpinBox { padding: 6px 10px; font-size: 14px; background-color: #1E2A44; color: #E0E8FF; "
+            "border: 1px solid #1F3B73; border-radius: 6px; }"
+        )
+
+        sla_label = QLabel("SLA (hours)")
+        sla_label.setStyleSheet("color: #B0BCD5; font-size: 13px;")
+        self.priority_sla_hours_spin = QSpinBox()
+        self.priority_sla_hours_spin.setRange(0, 720)
+        self.priority_sla_hours_spin.setValue(self._priority_sla_hours_default)
+        self.priority_sla_hours_spin.setSingleStep(24)
+        self.priority_sla_hours_spin.setStyleSheet(
+            "QSpinBox { padding: 6px 10px; font-size: 14px; background-color: #1E2A44; color: #E0E8FF; "
+            "border: 1px solid #1F3B73; border-radius: 6px; }"
+        )
+
+        self.priority_refresh_button = QPushButton("Refresh")
+        self.priority_refresh_button.setFixedWidth(140)
+        self.priority_refresh_button.setStyleSheet(
+            "padding: 10px; font-size: 15px; background-color: #1F3B73; color: white; border-radius: 6px;"
+        )
+        self.priority_refresh_button.clicked.connect(self.refresh_priority_orders)
+
+        controls_layout.addWidget(min_days_label)
+        controls_layout.addWidget(self.priority_min_days_spin)
+        controls_layout.addWidget(sla_label)
+        controls_layout.addWidget(self.priority_sla_hours_spin)
+        controls_layout.addWidget(self.priority_refresh_button)
+        layout.addLayout(controls_layout)
+
+        self.priority_status_label = QLabel("Select Refresh to load overdue orders.")
+        self.priority_status_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        self.priority_status_label.setStyleSheet("color: #B0BCD5; font-size: 13px;")
+        layout.addWidget(self.priority_status_label)
+
+        self.priority_orders_table = self._create_table_widget(
+            ["Order", "Customer", "State", "Created", "Open time", "SLA breach"]
+        )
+        self.priority_orders_table.setMinimumHeight(260)
+        table_panel = self._create_list_panel("Most overdue orders", self.priority_orders_table)
+        table_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
+        chart_panel = QFrame()
+        chart_panel.setFrameShape(QFrame.StyledPanel)
+        chart_panel.setStyleSheet(
+            "QFrame { background-color: #111C34; border: 1px solid #1F3B73; border-radius: 10px; }"
+        )
+        chart_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        chart_layout = QVBoxLayout(chart_panel)
+        chart_layout.setContentsMargins(16, 16, 16, 16)
+        chart_layout.setSpacing(12)
+
+        chart_title = QLabel("Overdue orders timeline")
+        chart_title.setStyleSheet("color: #E0E8FF; font-weight: 600; font-size: 14px;")
+        chart_layout.addWidget(chart_title)
+
+        self.priority_chart = QChart()
+        self.priority_chart.setBackgroundBrush(Qt.transparent)
+        self.priority_chart.legend().setVisible(False)
+        self.priority_timeline_series = QLineSeries()
+        self.priority_timeline_series.setColor(QColor(0xF9, 0x73, 0x16))
+        pen = QPen(QColor("#F97316"))
+        pen.setWidth(2)
+        self.priority_timeline_series.setPen(pen)
+        self.priority_timeline_series.setPointsVisible(True)
+        self.priority_chart.addSeries(self.priority_timeline_series)
+
+        self.priority_datetime_axis = QDateTimeAxis()
+        self.priority_datetime_axis.setLabelsColor(Qt.white)
+        self.priority_datetime_axis.setFormat("MMM d")
+        self.priority_datetime_axis.setTitleText("Period")
+        self.priority_datetime_axis.setTitleBrush(Qt.white)
+
+        self.priority_value_axis = QValueAxis()
+        self.priority_value_axis.setLabelsColor(Qt.white)
+        self.priority_value_axis.setLabelFormat("%d")
+        self.priority_value_axis.setTitleText("Overdue orders")
+        self.priority_value_axis.setTitleBrush(Qt.white)
+
+        self.priority_chart.addAxis(self.priority_datetime_axis, Qt.AlignBottom)
+        self.priority_chart.addAxis(self.priority_value_axis, Qt.AlignLeft)
+        self.priority_timeline_series.attachAxis(self.priority_datetime_axis)
+        self.priority_timeline_series.attachAxis(self.priority_value_axis)
+
+        self.priority_chart_view = QChartView(self.priority_chart)
+        self.priority_chart_view.setRenderHint(QPainter.Antialiasing, True)
+        self.priority_chart_view.setMinimumHeight(280)
+        self.priority_chart_view.setStyleSheet("background: rgba(32, 40, 62, 0.6);")
+        chart_layout.addWidget(self.priority_chart_view)
+
+        row_layout = QHBoxLayout()
+        row_layout.setSpacing(16)
+        row_layout.addWidget(table_panel, 1)
+        row_layout.addWidget(chart_panel, 1)
+        layout.addLayout(row_layout, 1)
+
+        heatmap_panel = QFrame()
+        heatmap_panel.setFrameShape(QFrame.StyledPanel)
+        heatmap_panel.setStyleSheet(
+            "QFrame { background-color: #111C34; border: 1px solid #1F3B73; border-radius: 10px; }"
+        )
+        heatmap_layout = QVBoxLayout(heatmap_panel)
+        heatmap_layout.setContentsMargins(16, 16, 16, 16)
+        heatmap_layout.setSpacing(12)
+
+        heatmap_title = QLabel("Overdue heatmap (customers × period)")
+        heatmap_title.setStyleSheet("color: #E0E8FF; font-weight: 600; font-size: 14px;")
+        heatmap_layout.addWidget(heatmap_title)
+
+        self.priority_heatmap_table = QTableWidget()
+        self.priority_heatmap_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.priority_heatmap_table.setSelectionMode(QAbstractItemView.NoSelection)
+        self.priority_heatmap_table.setFocusPolicy(Qt.NoFocus)
+        self.priority_heatmap_table.setAlternatingRowColors(False)
+        self.priority_heatmap_table.setColumnCount(0)
+        self.priority_heatmap_table.setRowCount(0)
+        self.priority_heatmap_table.horizontalHeader().setStretchLastSection(False)
+        self.priority_heatmap_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.priority_heatmap_table.horizontalHeader().setDefaultAlignment(Qt.AlignCenter)
+        vertical_header = self.priority_heatmap_table.verticalHeader()
+        vertical_header.setVisible(True)
+        vertical_header.setDefaultAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        vertical_header.setSectionResizeMode(QHeaderView.ResizeToContents)
+        self.priority_heatmap_table.setStyleSheet(
+            "QTableWidget { background-color: #0F172A; color: #E0E8FF; gridline-color: #1F3B73; }"
+        )
+        self.priority_heatmap_table.setMinimumHeight(220)
+        heatmap_layout.addWidget(self.priority_heatmap_table)
+
+        layout.addWidget(heatmap_panel, 1)
+
+        layout.addStretch()
+        return tab
     def _initialize_operational_range(self) -> None:
         today = QDate.currentDate()
         self.op_end_date_edit.setDate(today)
@@ -1940,6 +2155,285 @@ class MainWindow(QMainWindow):
             return
         self._begin_operational_fetch(start_dt, end_dt)
 
+    def refresh_priority_orders(self) -> None:
+        if self._priority_loading:
+            return
+        now = datetime.now(timezone.utc)
+        start_dt = now - timedelta(days=30)
+        min_days = int(self.priority_min_days_spin.value())
+        sla_hours = int(self.priority_sla_hours_spin.value())
+        self._begin_priority_fetch(start_dt, now, min_days, sla_hours)
+
+    def _begin_priority_fetch(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        min_days_overdue: int,
+        sla_hours: int,
+    ) -> None:
+        if self._priority_loading:
+            return
+        self._priority_last_payload = None
+        self._set_priority_loading(True)
+        range_text = f"{start_dt.strftime('%Y-%m-%d')} - {end_dt.strftime('%Y-%m-%d')}"
+        self._update_priority_status(f"Updating... | Range: {range_text}")
+
+        self._priority_thread = QThread(self)
+        self._priority_worker = PriorityOrdersWorker(
+            self._client,
+            date_from=start_dt,
+            date_to=end_dt,
+            min_days_overdue=min_days_overdue,
+            sla_hours=sla_hours,
+            top_limit=self._priority_top_limit,
+        )
+        self._priority_worker.moveToThread(self._priority_thread)
+        self._priority_thread.started.connect(self._priority_worker.process)
+        self._priority_worker.finished.connect(self._priority_thread.quit)
+        self._priority_worker.error.connect(self._priority_thread.quit)
+        self._priority_thread.finished.connect(self._priority_thread.deleteLater)
+        self._priority_worker.finished.connect(self._priority_worker.deleteLater)
+        self._priority_worker.error.connect(self._priority_worker.deleteLater)
+        self._priority_worker.finished.connect(self._on_priority_finished)
+        self._priority_worker.error.connect(self._on_priority_error)
+        self._priority_thread.finished.connect(self._on_priority_thread_finished)
+        self._priority_thread.start()
+
+    def _set_priority_loading(self, loading: bool) -> None:
+        self._priority_loading = loading
+        self.priority_refresh_button.setEnabled(not loading)
+        self.priority_min_days_spin.setEnabled(not loading)
+        self.priority_sla_hours_spin.setEnabled(not loading)
+        if loading:
+            self._update_priority_status("Loading overdue orders…")
+
+    def _update_priority_status(self, message: str) -> None:
+        self.priority_status_label.setText(message)
+
+    def _on_priority_finished(self, payload: Dict[str, Any]) -> None:
+        self._priority_last_payload = payload
+        self._apply_priority_payload(payload)
+
+    def _on_priority_error(self, message: str) -> None:
+        self._update_priority_status("Update failed")
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Critical)
+        box.setWindowTitle("Priority orders")
+        box.setText(message)
+        box.exec()
+
+    def _on_priority_thread_finished(self) -> None:
+        self._set_priority_loading(False)
+        self._priority_worker = None
+        self._priority_thread = None
+
+    def _apply_priority_payload(self, payload: Dict[str, Any]) -> None:
+        self._update_priority_kpis(payload.get("kpis", {}))
+        self._update_priority_table(payload.get("top_orders", []))
+        self._update_priority_chart(payload.get("timeline", []))
+        self._update_priority_heatmap(payload.get("heatmap", []))
+        params = payload.get("params", {})
+        start_text = params.get("date_from")
+        end_text = params.get("date_to")
+        try:
+            if isinstance(start_text, str) and isinstance(end_text, str):
+                start_dt = datetime.fromisoformat(start_text)
+                end_dt = datetime.fromisoformat(end_text)
+                if start_dt.tzinfo is None:
+                    start_dt = start_dt.replace(tzinfo=timezone.utc)
+                if end_dt.tzinfo is None:
+                    end_dt = end_dt.replace(tzinfo=timezone.utc)
+                timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+                range_text = f"{start_dt.strftime('%Y-%m-%d')} - {end_dt.strftime('%Y-%m-%d')}"
+                self._update_priority_status(f"Last update: {timestamp} | Range: {range_text}")
+                return
+            raise ValueError
+        except Exception:
+            self._update_priority_status("Priority orders refreshed.")
+
+    def _update_priority_kpis(self, kpis: Dict[str, Any]) -> None:
+        self.priority_total_value.setText(self._format_number(kpis.get("total_overdue")))
+        self.priority_breach_value.setText(self._format_number(kpis.get("overdue_beyond_sla")))
+
+    def _update_priority_table(self, records: Sequence[Dict[str, Any]]) -> None:
+        table = self.priority_orders_table
+        table.setRowCount(0)
+        sla_hours = float(self.priority_sla_hours_spin.value())
+        if not isinstance(records, Sequence):
+            records = []
+        for entry in records:
+            if not isinstance(entry, dict):
+                continue
+            order_display = entry.get("custom_formatted_id") or entry.get("order_id") or ""
+            customer = entry.get("customer_name") or ""
+            state_text = str(entry.get("state") or "").replace("_", " ").title()
+            created = entry.get("date_created")
+            open_hours = float(entry.get("open_hours") or 0.0)
+            breach = open_hours > sla_hours if sla_hours > 0 else open_hours > 0
+
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(str(order_display)))
+            table.setItem(row, 1, QTableWidgetItem(str(customer)))
+            table.setItem(row, 2, QTableWidgetItem(state_text))
+            table.setItem(row, 3, QTableWidgetItem(self._format_priority_timestamp(created)))
+            table.setItem(row, 4, QTableWidgetItem(self._format_duration_hours(open_hours)))
+            breach_item = QTableWidgetItem("Yes" if breach else "No")
+            if breach:
+                breach_item.setForeground(QBrush(QColor("#F97316")))
+            table.setItem(row, 5, breach_item)
+        table.resizeColumnsToContents()
+
+        if table.rowCount() == 0:
+            self._update_priority_status("No overdue orders found in the last 30 days.")
+
+    def _update_priority_chart(self, points: Sequence[Dict[str, Any]]) -> None:
+        self.priority_timeline_series.clear()
+        if not isinstance(points, Sequence) or not points:
+            now = datetime.now(timezone.utc)
+            start = now - timedelta(days=30)
+            self.priority_datetime_axis.setRange(QDateTime(start), QDateTime(now))
+            self.priority_value_axis.setRange(0, 1)
+            return
+
+        min_dt: Optional[datetime] = None
+        max_dt: Optional[datetime] = None
+        max_value = 1
+        for entry in points:
+            if not isinstance(entry, dict):
+                continue
+            dt_value = entry.get("period_start")
+            if not isinstance(dt_value, datetime):
+                continue
+            overdue = int(entry.get("overdue_orders") or 0)
+            qdt = QDateTime(dt_value)
+            self.priority_timeline_series.append(qdt.toMSecsSinceEpoch(), overdue)
+            min_dt = dt_value if min_dt is None or dt_value < min_dt else min_dt
+            max_dt = dt_value if max_dt is None or dt_value > max_dt else max_dt
+            if overdue > max_value:
+                max_value = overdue
+
+        if min_dt and max_dt:
+            self.priority_datetime_axis.setRange(QDateTime(min_dt), QDateTime(max_dt))
+        else:
+            now = datetime.now(timezone.utc)
+            start = now - timedelta(days=30)
+            self.priority_datetime_axis.setRange(QDateTime(start), QDateTime(now))
+
+        self.priority_value_axis.setRange(0, max(1, max_value))
+
+    def _update_priority_heatmap(self, entries: Sequence[Dict[str, Any]]) -> None:
+        table = self.priority_heatmap_table
+        if table is None:
+            return
+        table.setUpdatesEnabled(False)
+        table.clearContents()
+        table.setRowCount(0)
+        table.setColumnCount(0)
+        self._priority_heatmap_periods = []
+        self._priority_heatmap_customers = []
+
+        if not isinstance(entries, Sequence) or not entries:
+            table.setUpdatesEnabled(True)
+            return
+
+        periods_set: Dict[datetime, None] = {}
+        customers_map: Dict[str, str] = {}
+        counts: Dict[Tuple[str, datetime], int] = {}
+        max_value = 0
+
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            customer_name = entry.get("customer_name") or ""
+            customer_id = entry.get("customer_id")
+            if not customer_name and customer_id is not None:
+                customer_name = f"Customer {customer_id}"
+            dt_value = entry.get("period_start")
+            if not isinstance(dt_value, datetime):
+                continue
+            overdue = int(entry.get("overdue_orders") or 0)
+            key = (customer_name or "Unknown", dt_value)
+            counts[key] = overdue
+            if overdue > max_value:
+                max_value = overdue
+            periods_set[dt_value] = None
+            customers_map[customer_name or "Unknown"] = customer_name or "Unknown"
+
+        periods = sorted(periods_set.keys())
+        customers = sorted(customers_map.values())
+        self._priority_heatmap_periods = periods
+        self._priority_heatmap_customers = customers
+
+        table.setColumnCount(len(periods))
+        column_headers = [dt.strftime("%Y-%m-%d") for dt in periods]
+        table.setHorizontalHeaderLabels(column_headers)
+        table.setRowCount(len(customers))
+        for row, customer in enumerate(customers):
+            label = customer or "Unknown"
+            table.setVerticalHeaderItem(row, QTableWidgetItem(label))
+
+        if max_value <= 0:
+            max_value = 1
+
+        for row, customer in enumerate(customers):
+            for col, period in enumerate(periods):
+                value = counts.get((customer, period), 0)
+                if value <= 0:
+                    item = QTableWidgetItem("")
+                    color = QColor("#182238")
+                else:
+                    item = QTableWidgetItem(str(value))
+                    color = self._priority_heat_color(value / float(max_value))
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setBackground(QBrush(color))
+                if value > 0 and (color.red() + color.green() + color.blue()) / 3 > 192:
+                    item.setForeground(QBrush(QColor("#0F172A")))
+                else:
+                    item.setForeground(QBrush(QColor("#E0E8FF")))
+                table.setItem(row, col, item)
+
+        table.resizeColumnsToContents()
+        table.setUpdatesEnabled(True)
+
+    @staticmethod
+    def _priority_heat_color(ratio: float) -> QColor:
+        clamped = max(0.0, min(1.0, ratio))
+        start_color = QColor("#1E2A44")
+        end_color = QColor("#FF8FAB")
+        r = int(start_color.red() + (end_color.red() - start_color.red()) * clamped)
+        g = int(start_color.green() + (end_color.green() - start_color.green()) * clamped)
+        b = int(start_color.blue() + (end_color.blue() - start_color.blue()) * clamped)
+        return QColor(r, g, b)
+
+    @staticmethod
+    def _format_priority_timestamp(value: Optional[datetime]) -> str:
+        if not isinstance(value, datetime):
+            return ""
+        normalized = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+        normalized = normalized.astimezone(timezone.utc)
+        return normalized.strftime("%Y-%m-%d %H:%M")
+
+    @staticmethod
+    def _format_duration_hours(value: Any) -> str:
+        try:
+            hours_total = float(value)
+        except (TypeError, ValueError):
+            return ""
+        if hours_total <= 0:
+            return "<1h"
+        minutes_total = int(round(hours_total * 60))
+        days = minutes_total // (24 * 60)
+        hours = (minutes_total % (24 * 60)) // 60
+        if days and hours:
+            return f"{days}d {hours}h"
+        if days:
+            return f"{days}d"
+        if hours:
+            return f"{hours}h"
+        minutes = minutes_total % 60
+        return f"{minutes}m"
+
     def _on_operational_timeframe_changed(self, index: int) -> None:
         mode = self._operational_timeframe_combo.itemData(index)
         if mode not in {"day", "week", "month"}:
@@ -1954,6 +2448,9 @@ class MainWindow(QMainWindow):
         if index == self._operational_tab_index and not self._operational_initialized:
             self._operational_initialized = True
             self.refresh_operational_data()
+        elif index == getattr(self, "_priority_tab_index", -1) and not self._priority_initialized:
+            self._priority_initialized = True
+            self.refresh_priority_orders()
 
     def _on_operational_finished(self, summary: Dict[str, Any]) -> None:
         self._apply_operational_summary(summary)
@@ -2009,9 +2506,19 @@ class MainWindow(QMainWindow):
             return "--"
         if numeric <= 0.0:
             return "--"
-        if numeric >= 100.0:
-            return f"{numeric:.0f} h"
-        return f"{numeric:.1f} h"
+        minutes_total = int(round(numeric * 60))
+        if minutes_total <= 0:
+            return "<1h"
+        days = minutes_total // (24 * 60)
+        hours = (minutes_total % (24 * 60)) // 60
+        if days and hours:
+            return f"{days}d {hours}h"
+        if days:
+            return f"{days}d"
+        if hours:
+            return f"{hours}h"
+        minutes = minutes_total % 60
+        return f"{minutes}m"
 
     @staticmethod
     def _format_number(value: Any) -> str:

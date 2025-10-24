@@ -879,3 +879,161 @@ class LocalAPIClient(DataClientInterface):
                 "age_hours": float(item.get("median_completion_hours") or 0.0),
             })
         return derived
+
+    def fetch_overdue_orders(
+        self,
+        *,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        min_days_overdue: int = 5,
+        sla_hours: int = 240,
+        top_limit: int = 50,
+    ) -> Dict[str, Any]:
+        now = datetime.now(timezone.utc)
+
+        def _normalize(value: Optional[datetime], *, default: datetime) -> datetime:
+            if value is None:
+                return default
+            if value.tzinfo is None:
+                return value.replace(tzinfo=timezone.utc)
+            return value.astimezone(timezone.utc)
+
+        end_dt = _normalize(date_to, default=now)
+        start_dt = _normalize(date_from, default=end_dt - timedelta(days=30))
+        if end_dt < start_dt:
+            start_dt, end_dt = end_dt, start_dt
+
+        params = {
+            "date_from": start_dt.isoformat(),
+            "date_to": end_dt.isoformat(),
+            "min_days_overdue": max(0, int(min_days_overdue)),
+            "sla_hours": max(0, int(sla_hours)),
+            "top_limit": max(1, int(top_limit)),
+        }
+
+        try:
+            payload = self._request(self.session.get, "analytics/orders/overdue", params=params)
+        except LocalAPIError:
+            raise
+        except Exception as exc:
+            raise LocalAPIError(f"Failed to fetch overdue orders: {exc}") from exc
+
+        def _parse_datetime(value: Any) -> Optional[datetime]:
+            if not isinstance(value, str):
+                return None
+            text = value.strip()
+            if not text:
+                return None
+            try:
+                parsed = datetime.fromisoformat(text)
+            except ValueError:
+                return None
+            if parsed.tzinfo is None:
+                return parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+
+        result: Dict[str, Any] = {
+            "kpis": {},
+            "top_orders": [],
+            "timeline": [],
+            "heatmap": [],
+            "state_breakdown": [],
+            "clients": [],
+            "params": params,
+        }
+        if isinstance(payload, dict):
+            kpis = payload.get("kpis")
+            if isinstance(kpis, dict):
+                result["kpis"] = {
+                    "total_overdue": int(kpis.get("total_overdue") or 0),
+                    "average_open_hours": float(kpis.get("average_open_hours") or 0.0),
+                    "max_open_hours": float(kpis.get("max_open_hours") or 0.0),
+                    "percent_overdue_vs_active": float(kpis.get("percent_overdue_vs_active") or 0.0),
+                    "overdue_beyond_sla": int(kpis.get("overdue_beyond_sla") or 0),
+                    "overdue_within_sla": int(kpis.get("overdue_within_sla") or 0),
+                }
+
+            orders_payload = payload.get("top_orders")
+            if isinstance(orders_payload, list):
+                normalized_orders: List[Dict[str, Any]] = []
+                for item in orders_payload:
+                    if not isinstance(item, dict):
+                        continue
+                    normalized_orders.append({
+                        "order_id": item.get("order_id"),
+                        "custom_formatted_id": item.get("custom_formatted_id") or "",
+                        "customer_id": item.get("customer_id"),
+                        "customer_name": item.get("customer_name") or "",
+                        "state": item.get("state") or "",
+                        "date_created": _parse_datetime(item.get("date_created")),
+                        "open_hours": float(item.get("open_hours") or 0.0),
+                    })
+                result["top_orders"] = normalized_orders
+
+            timeline_payload = payload.get("timeline")
+            if isinstance(timeline_payload, list):
+                normalized_timeline: List[Dict[str, Any]] = []
+                for point in timeline_payload:
+                    if not isinstance(point, dict):
+                        continue
+                    period = point.get("period_start")
+                    period_dt = _parse_datetime(period)
+                    # Some endpoints return plain dates without time; treat as naive if parse failed.
+                    if period_dt is None and isinstance(period, str):
+                        try:
+                            period_dt = datetime.fromisoformat(period + "T00:00:00")
+                        except ValueError:
+                            period_dt = None
+                        if period_dt and period_dt.tzinfo is None:
+                            period_dt = period_dt.replace(tzinfo=timezone.utc)
+                    normalized_timeline.append({
+                        "period_start": period_dt,
+                        "overdue_orders": int(point.get("overdue_orders") or 0),
+                    })
+                result["timeline"] = normalized_timeline
+
+            heatmap_payload = payload.get("heatmap")
+            if isinstance(heatmap_payload, list):
+                normalized_heatmap: List[Dict[str, Any]] = []
+                for entry in heatmap_payload:
+                    if not isinstance(entry, dict):
+                        continue
+                    period_dt = _parse_datetime(entry.get("period_start"))
+                    normalized_heatmap.append({
+                        "customer_id": entry.get("customer_id"),
+                        "customer_name": entry.get("customer_name") or "",
+                        "period_start": period_dt,
+                        "overdue_orders": int(entry.get("overdue_orders") or 0),
+                    })
+                result["heatmap"] = normalized_heatmap
+
+            state_payload = payload.get("state_breakdown")
+            if isinstance(state_payload, list):
+                normalized_states: List[Dict[str, Any]] = []
+                for entry in state_payload:
+                    if not isinstance(entry, dict):
+                        continue
+                    normalized_states.append({
+                        "state": entry.get("state") or "",
+                        "count": int(entry.get("count") or 0),
+                        "ratio": float(entry.get("ratio") or 0.0),
+                    })
+                result["state_breakdown"] = normalized_states
+
+            clients_payload = payload.get("clients")
+            if isinstance(clients_payload, list):
+                normalized_clients: List[Dict[str, Any]] = []
+                for entry in clients_payload:
+                    if not isinstance(entry, dict):
+                        continue
+                    normalized_clients.append({
+                        "customer_id": entry.get("customer_id"),
+                        "customer_name": entry.get("customer_name") or "",
+                        "overdue_orders": int(entry.get("overdue_orders") or 0),
+                        "total_open_hours": float(entry.get("total_open_hours") or 0.0),
+                        "average_open_hours": float(entry.get("average_open_hours") or 0.0),
+                        "max_open_hours": float(entry.get("max_open_hours") or 0.0),
+                    })
+                result["clients"] = normalized_clients
+
+        return result

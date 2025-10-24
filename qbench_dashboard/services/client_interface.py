@@ -127,3 +127,16 @@ class DataClientInterface(ABC):
     ) -> List[Dict[str, Any]]:
         """Fetch or derive the slowest orders for the given date range."""
         pass
+
+    @abstractmethod
+    def fetch_overdue_orders(
+        self,
+        *,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        min_days_overdue: int = 5,
+        sla_hours: int = 240,
+        top_limit: int = 50,
+    ) -> Dict[str, Any]:
+        """Fetch overdue orders analytics used for prioritizing work."""
+        pass

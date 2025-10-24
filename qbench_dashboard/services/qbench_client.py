@@ -658,6 +658,17 @@ class QBenchClient(DataClientInterface):
     ) -> List[Dict[str, Any]]:
         raise QBenchError("Operational efficiency analytics are not supported for QBench provider.")
 
+    def fetch_overdue_orders(
+        self,
+        *,
+        date_from: Optional[datetime] = None,
+        date_to: Optional[datetime] = None,
+        min_days_overdue: int = 5,
+        sla_hours: int = 240,
+        top_limit: int = 50,
+    ) -> Dict[str, Any]:
+        raise QBenchError("Priority orders analytics are not supported for QBench provider.")
+
     def _extract_samples(self, payload: Dict[str, Any]) -> List[Dict[str, Any]]:
         data = payload.get("data")
         if not data:
