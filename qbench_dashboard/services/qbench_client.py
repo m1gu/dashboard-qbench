@@ -5,7 +5,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 import jwt
 import requests
 
-from qbench_dashboard.config import QBenchSettings, get_qbench_settings
+from qbench_dashboard.config import QBenchSettings, get_qbench_settings, is_frozen_build
 from qbench_dashboard.services.client_interface import DataClientInterface
 
 
@@ -38,8 +38,9 @@ class QBenchClient(DataClientInterface):
             "grant_type": "urn:ietf:params:oauth:grant-type:jwt-bearer",
             "assertion": assertion,
         }
+        timeout = 10 if is_frozen_build() else 30
         try:
-            response = self.session.post(url, data=data, timeout=30)
+            response = self.session.post(url, data=data, timeout=timeout)
             response.raise_for_status()
         except requests.RequestException as exc:
             self._token = ""
@@ -59,16 +60,19 @@ class QBenchClient(DataClientInterface):
 
     def _request(self, method, path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.settings.base_url}/qbench/api/v1/{path.lstrip('/')}"
-        delay = 1.0
-        for _ in range(5):
+        frozen = is_frozen_build()
+        delay = 0.5 if frozen else 1.0
+        max_attempts = 2 if frozen else 5
+        timeout = 10 if frozen else 30
+        for _ in range(max_attempts):
             if self._is_token_expired():
                 self._authenticate()
             headers = {"Authorization": f"Bearer {self._token}", "Accept": "application/json"}
             try:
-                resp = method(url, params=params, headers=headers, timeout=30)
+                resp = method(url, params=params, headers=headers, timeout=timeout)
             except requests.Timeout:
                 time.sleep(delay)
-                delay = min(delay * 2, 16)
+                delay = min(delay * 2, 4 if frozen else 16)
                 continue
             except requests.RequestException as exc:
                 raise QBenchError(f"Request failed: {exc}") from exc
@@ -77,13 +81,13 @@ class QBenchClient(DataClientInterface):
                 self._token = ""
                 self._token_exp = 0.0
                 time.sleep(delay)
-                delay = min(delay * 2, 16)
+                delay = min(delay * 2, 4 if frozen else 16)
                 continue
             if resp.status_code == 429:
                 retry_after = resp.headers.get("Retry-After")
                 wait_s = float(retry_after) if retry_after else delay
                 time.sleep(wait_s)
-                delay = min(delay * 2, 16)
+                delay = min(delay * 2, 4 if frozen else 16)
                 continue
 
             try:

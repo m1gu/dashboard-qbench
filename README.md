@@ -31,7 +31,7 @@ Configura las variables de entorno requeridas en `.env` (ver `qbench_dashboard/c
 ### Opciones de DATA_PROVIDER
 - `qbench`: usa las credenciales OAuth de QBench y la API remota oficial.
 - `local`: apunta al servicio local (`http://localhost:8000`) pensado para desarrollo.
-- `online`: reutiliza los mismos endpoints que `local` pero con el tunel remoto `https://6v12xcxn-8000.use.devtunnels.ms`.
+- `online`: reutiliza los mismos endpoints que `local` pero con el tunel remoto `https://615c98lc-8000.use.devtunnels.ms`.
 
 En todos los casos se puede sobrescribir `LOCAL_API_BASE_URL` en `.env`; el valor se normaliza automaticamente para eliminar un `/` final si estuviera presente.
 
@@ -51,3 +51,13 @@ qbench_dashboard/
 - Ejecuta `python -m py_compile ...` para validaciones rápidas.
 - Usa `git status` para inspeccionar cambios antes de hacer commit.
 
+## Distribucion como ejecutable (.exe)
+1. Instala PyInstaller: `pip install pyinstaller`.
+2. Ejecuta `python build_exe.py` desde la raíz del proyecto (genera `dist/MCRLabsDashboard/`).
+3. Distribuye el contenido de `dist/MCRLabsDashboard/` y utiliza `MCRLabsDashboard.exe`.
+
+### Notas del build
+- El paquete congelado fuerza `DATA_PROVIDER=online` y usa `https://615c98lc-8000.use.devtunnels.ms` por defecto.
+- Antes de abrir la ventana, el ejecutable verifica la conectividad con un timeout corto; si falla, muestra una alerta y termina.
+- Los clientes HTTP reducen reintentos y timeouts en modo empaquetado para evitar bloqueos al perder internet.
+- Se recomienda ejecutar el `.exe` en un entorno con conexión estable; la carpeta `dist` incluye todas las dependencias necesarias.

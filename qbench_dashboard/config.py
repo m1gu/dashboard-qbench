@@ -1,4 +1,5 @@
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -9,7 +10,7 @@ load_dotenv(ROOT.parent / ".env")
 
 DEFAULT_LOCAL_BASE_URLS = {
     "local": "http://localhost:8000",
-    "online": "https://6v12xcxn-8000.use.devtunnels.ms",
+    "online": "https://615c98lc-8000.use.devtunnels.ms",
 }
 
 
@@ -63,5 +64,12 @@ def get_local_api_settings() -> LocalAPISettings:
 
 
 def get_data_provider() -> str:
-    """Returns the configured data provider: 'qbench', 'local' or 'online'"""
+    """Returns the configured data provider: 'qbench', 'local' or 'online'."""
+    if is_frozen_build():
+        return "online"
     return os.getenv("DATA_PROVIDER", "qbench").lower()
+
+
+def is_frozen_build() -> bool:
+    """True when running from a PyInstaller/standalone bundle."""
+    return bool(getattr(sys, "frozen", False))

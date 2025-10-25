@@ -500,7 +500,7 @@ class MainWindow(QMainWindow):
         self._priority_heatmap_periods: List[datetime] = []
         self._priority_heatmap_customers: List[str] = []
 
-        self.setWindowTitle("QBench Dashboard")
+        self.setWindowTitle("MCRLabs Dashboard")
         self.resize(1280, 720)
         self._apply_dark_palette()
 
