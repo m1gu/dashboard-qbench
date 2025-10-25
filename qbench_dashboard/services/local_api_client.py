@@ -4,11 +4,7 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import requests
 
-from qbench_dashboard.config import (
-    LocalAPISettings,
-    get_local_api_settings,
-    is_frozen_build,
-)
+from qbench_dashboard.config import LocalAPISettings, get_local_api_settings
 from qbench_dashboard.services.client_interface import DataClientInterface
 
 
@@ -26,17 +22,14 @@ class LocalAPIClient(DataClientInterface):
 
     def _request(self, method, path: str, *, params: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
         url = f"{self.settings.base_url}/api/v1/{path.lstrip('/')}"
-        frozen = is_frozen_build()
-        delay = 0.5 if frozen else 1.0
-        max_attempts = 2 if frozen else 5
-        timeout = 10 if frozen else 30
-        for _ in range(max_attempts):
+        delay = 1.0
+        for _ in range(5):
             headers = {"Accept": "application/json"}
             try:
-                resp = method(url, params=params, headers=headers, timeout=timeout)
+                resp = method(url, params=params, headers=headers, timeout=30)
             except requests.Timeout:
                 time.sleep(delay)
-                delay = min(delay * 2, 4 if frozen else 16)
+                delay = min(delay * 2, 16)
                 continue
             except requests.RequestException as exc:
                 raise LocalAPIError(f"Request failed: {exc}") from exc
@@ -45,7 +38,7 @@ class LocalAPIClient(DataClientInterface):
                 retry_after = resp.headers.get("Retry-After")
                 wait_s = float(retry_after) if retry_after else delay
                 time.sleep(wait_s)
-                delay = min(delay * 2, 4 if frozen else 16)
+                delay = min(delay * 2, 16)
                 continue
 
             try:
@@ -1026,6 +1019,27 @@ class LocalAPIClient(DataClientInterface):
                         "ratio": float(entry.get("ratio") or 0.0),
                     })
                 result["state_breakdown"] = normalized_states
+
+            ready_payload = payload.get("ready_to_report_samples")
+            if isinstance(ready_payload, list):
+                normalized_ready: List[Dict[str, Any]] = []
+                for entry in ready_payload:
+                    if not isinstance(entry, dict):
+                        continue
+                    normalized_ready.append({
+                        "sample_id": entry.get("sample_id"),
+                        "sample_name": entry.get("sample_name") or entry.get("sample_custom_id") or "",
+                        "sample_custom_id": entry.get("sample_custom_id"),
+                        "order_id": entry.get("order_id"),
+                        "order_custom_id": entry.get("order_custom_id"),
+                        "customer_id": entry.get("customer_id"),
+                        "customer_name": entry.get("customer_name") or "",
+                        "date_created": _parse_datetime(entry.get("date_created")),
+                        "completed_date": _parse_datetime(entry.get("completed_date")),
+                        "tests_ready_count": int(entry.get("tests_ready_count") or 0),
+                        "tests_total_count": int(entry.get("tests_total_count") or 0),
+                    })
+                result["ready_to_report_samples"] = normalized_ready
 
             clients_payload = payload.get("clients")
             if isinstance(clients_payload, list):

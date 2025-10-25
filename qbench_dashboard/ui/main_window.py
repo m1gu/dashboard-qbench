@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -49,6 +50,7 @@ from qbench_dashboard.services.summary import build_summary
 
 class SummaryWorker(QObject):
     finished = Signal(dict)
+    progress = Signal(dict)
     error = Signal(str)
 
     def __init__(
@@ -67,63 +69,9 @@ class SummaryWorker(QObject):
 
     def process(self) -> None:
         try:
-            samples = self._client.fetch_recent_samples(
-                start_date=self._start_date,
-                end_date=self._end_date,
-            )
-            samples_total = len(samples)
-            total_getter = getattr(self._client, "get_last_samples_total", None)
-            if callable(total_getter):
-                try:
-                    reported_total = total_getter()
-                except Exception:  # pragma: no cover - defensive
-                    reported_total = None
-                if reported_total is not None:
-                    try:
-                        samples_total = int(reported_total)
-                    except (TypeError, ValueError):
-                        pass
-            counts = {}
-            for sample in samples:
-                created = sample.get("date_created")
-                if isinstance(created, datetime):
-                    key = created.date()
-                    counts[key] = counts.get(key, 0) + 1
-            samples_series = [
-                (datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc), count)
-                for day, count in sorted(counts.items())
-            ]
-            sample_ids: List[str] = []
-            seen_ids = set()
-            report_seen = set()
-            reports_total = 0
-            for sample in samples:
-                sid = sample.get("id")
-                if sid and sid not in seen_ids:
-                    seen_ids.add(sid)
-                    sample_ids.append(sid)
-                has_report = sample.get("has_report") or str(sample.get("status", "")).upper() == "REPORTED"
-                if has_report and sid and sid not in report_seen:
-                    report_seen.add(sid)
-                    reports_total += 1
-            reports_getter = getattr(self._client, "get_last_reports_total", None)
-            if callable(reports_getter):
-                try:
-                    reported_reports = reports_getter()
-                except Exception:  # pragma: no cover - defensive
-                    reported_reports = None
-                if reported_reports is not None:
-                    try:
-                        reports_total = int(reported_reports)
-                    except (TypeError, ValueError):
-                        pass
-            range_start = self._start_date
-            range_end = self._end_date
             now_utc = datetime.now(timezone.utc)
-            if range_end is None:
-                range_end = now_utc
-            if range_start is None:
-                range_start = range_end - timedelta(days=6)
+            range_end = self._end_date or now_utc
+            range_start = self._start_date or range_end - timedelta(days=6)
             if range_end < range_start:
                 range_start, range_end = range_end, range_start
             period_delta = range_end - range_start
@@ -132,7 +80,6 @@ class SummaryWorker(QObject):
                 previous_end = range_start - timedelta(microseconds=1)
                 previous_start = previous_end - period_delta
                 previous_range = (previous_start, previous_end)
-            tests_sample_ids = sample_ids if previous_range is None else None
 
             def _load_customers() -> Tuple[List[Dict[str, Any]], int]:
                 try:
@@ -157,81 +104,197 @@ class SummaryWorker(QObject):
                 except Exception:
                     return []
 
-            (
-                tests_total,
-                tests_series,
-                tat_sum_seconds,
-                tat_count,
-                tat_daily,
-                tat_previous_daily,
-            ) = self._client.count_recent_tests(
-                start_date=self._start_date,
-                end_date=self._end_date,
-                sample_ids=tests_sample_ids,
-                previous_range=previous_range,
-            )
-            customer_records, customers_total = _load_customers()
-            customer_orders = _load_orders()
+            def _load_labels() -> List[Dict[str, Any]]:
+                try:
+                    return self._client.fetch_test_label_distribution(
+                        start_date=self._start_date,
+                        end_date=self._end_date,
+                    )
+                except Exception:
+                    return []
+
+            samples: List[Dict[str, Any]] = []
+            samples_total = 0
+            reports_total = 0
+            samples_series: List[Tuple[datetime, int]] = []
+            aggregated_samples_series: List[Tuple[datetime, int]] = []
+            sample_ids: List[str] = []
+
+            customer_records: List[Dict[str, Any]] = []
+            customers_total = 0
+            customer_orders: List[Dict[str, Any]] = []
             toppers: List[Dict[str, Any]] = []
-            if customer_orders:
-                name_map = {
-                    str(item.get("id")): (item.get("name") or "")
-                    for item in customer_records
-                    if isinstance(item, dict) and item.get("id") is not None
-                }
-                aggregates: Dict[str, Dict[str, Any]] = {}
-                fallback_datetime = datetime.min.replace(tzinfo=timezone.utc)
-                for order in customer_orders:
-                    customer_id = order.get("customer_id")
-                    if not customer_id:
-                        continue
-                    entry = aggregates.get(customer_id)
-                    if entry is None:
-                        display_name = name_map.get(customer_id, "") or order.get("customer_name") or ""
-                        entry = {
-                            "id": customer_id,
-                            "name": display_name,
-                            "test_count": 0,
-                            "date_last_order": None,
-                        }
-                        aggregates[customer_id] = entry
-                    elif not entry.get("name"):
-                        entry["name"] = name_map.get(customer_id, "") or order.get("customer_name") or customer_id
-                    entry["test_count"] += int(order.get("test_count") or 0)
-                    created = order.get("date_created")
-                    if isinstance(created, datetime):
-                        last = entry.get("date_last_order")
-                        if last is None or created > last:
-                            entry["date_last_order"] = created
-                for entry in aggregates.values():
-                    if not entry.get("name"):
-                        entry["name"] = entry["id"]
-                toppers = sorted(
-                    aggregates.values(),
-                    key=lambda item: (
-                        item.get("test_count", 0),
-                        item.get("date_last_order") or fallback_datetime,
-                    ),
-                    reverse=True,
-                )
-                for entry in toppers[:10]:
-                    if not entry.get("name") or entry.get("name") == entry.get("id"):
-                        details = self._client.fetch_customer_details(entry["id"])
-                        if details and details.get("name"):
-                            entry["name"] = details.get("name") or entry["id"]
-            try:
-                label_distribution = self._client.fetch_test_label_distribution(
+            label_distribution: List[Dict[str, Any]] = []
+
+            tests_total = 0
+            tests_series: List[Tuple[datetime, int]] = []
+            aggregated_tests_series: List[Tuple[datetime, int]] = []
+            tat_sum_seconds = 0.0
+            tat_count = 0
+            tat_daily: List[Tuple[datetime, float, int]] = []
+            tat_previous_daily: List[Tuple[datetime, float, int]] = []
+
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                samples_future = executor.submit(
+                    self._client.fetch_recent_samples,
                     start_date=self._start_date,
                     end_date=self._end_date,
                 )
-            except Exception:
-                label_distribution = []
-            if tests_series is None:
-                tests_series = []
-            else:
-                tests_series = list(tests_series)
-            aggregated_samples_series = self._aggregate_time_series(samples_series, self._timeframe)
-            aggregated_tests_series = self._aggregate_time_series(tests_series, self._timeframe)
+                customers_future = executor.submit(_load_customers)
+                orders_future = executor.submit(_load_orders)
+                labels_future = executor.submit(_load_labels)
+
+                samples = samples_future.result()
+                samples_total = len(samples)
+                total_getter = getattr(self._client, "get_last_samples_total", None)
+                if callable(total_getter):
+                    try:
+                        reported_total = total_getter()
+                    except Exception:  # pragma: no cover - defensive
+                        reported_total = None
+                    if reported_total is not None:
+                        try:
+                            samples_total = int(reported_total)
+                        except (TypeError, ValueError):
+                            pass
+                counts: Dict[datetime, int] = {}
+                seen_ids = set()
+                report_seen = set()
+                for sample in samples:
+                    created = sample.get("date_created")
+                    if isinstance(created, datetime):
+                        key = created.date()
+                        counts[key] = counts.get(key, 0) + 1
+                    sid = sample.get("id")
+                    if sid and sid not in seen_ids:
+                        seen_ids.add(sid)
+                        sample_ids.append(sid)
+                    has_report = sample.get("has_report") or str(sample.get("status", "")).upper() == "REPORTED"
+                    if has_report and sid and sid not in report_seen:
+                        report_seen.add(sid)
+                        reports_total += 1
+                samples_series = [
+                    (datetime.combine(day, datetime.min.time(), tzinfo=timezone.utc), count)
+                    for day, count in sorted(counts.items())
+                ]
+                reports_getter = getattr(self._client, "get_last_reports_total", None)
+                if callable(reports_getter):
+                    try:
+                        reported_reports = reports_getter()
+                    except Exception:  # pragma: no cover - defensive
+                        reported_reports = None
+                    if reported_reports is not None:
+                        try:
+                            reports_total = int(reported_reports)
+                        except (TypeError, ValueError):
+                            pass
+                aggregated_samples_series = self._aggregate_time_series(samples_series, self._timeframe)
+                self.progress.emit({
+                    "stage": "overview",
+                    "samples_total": samples_total,
+                    "reports_total": reports_total,
+                    "samples_series": aggregated_samples_series,
+                    "timeframe": self._timeframe,
+                })
+
+                tests_sample_ids: Optional[List[str]] = sample_ids if previous_range is None else None
+                tests_future = executor.submit(
+                    self._client.count_recent_tests,
+                    start_date=self._start_date,
+                    end_date=self._end_date,
+                    sample_ids=tests_sample_ids,
+                    previous_range=previous_range,
+                )
+
+                customer_records, customers_total = customers_future.result()
+                self.progress.emit({
+                    "stage": "customers",
+                    "customers_recent": customer_records,
+                    "customers_total": customers_total,
+                })
+
+                customer_orders = orders_future.result()
+                if customer_orders:
+                    name_map = {
+                        str(item.get("id")): (item.get("name") or "")
+                        for item in customer_records
+                        if isinstance(item, dict) and item.get("id") is not None
+                    }
+                    aggregates: Dict[str, Dict[str, Any]] = {}
+                    fallback_datetime = datetime.min.replace(tzinfo=timezone.utc)
+                    for order in customer_orders:
+                        customer_id = order.get("customer_id")
+                        if not customer_id:
+                            continue
+                        entry = aggregates.get(customer_id)
+                        if entry is None:
+                            display_name = name_map.get(customer_id, "") or order.get("customer_name") or ""
+                            entry = {
+                                "id": customer_id,
+                                "name": display_name,
+                                "test_count": 0,
+                                "date_last_order": None,
+                            }
+                            aggregates[customer_id] = entry
+                        elif not entry.get("name"):
+                            entry["name"] = name_map.get(customer_id, "") or order.get("customer_name") or customer_id
+                        entry["test_count"] += int(order.get("test_count") or 0)
+                        created = order.get("date_created")
+                        if isinstance(created, datetime):
+                            last = entry.get("date_last_order")
+                            if last is None or created > last:
+                                entry["date_last_order"] = created
+                    for entry in aggregates.values():
+                        if not entry.get("name"):
+                            entry["name"] = entry["id"]
+                    toppers = sorted(
+                        aggregates.values(),
+                        key=lambda item: (
+                            item.get("test_count", 0),
+                            item.get("date_last_order") or fallback_datetime,
+                        ),
+                        reverse=True,
+                    )
+                    for entry in toppers[:10]:
+                        if not entry.get("name") or entry.get("name") == entry.get("id"):
+                            details = self._client.fetch_customer_details(entry["id"])
+                            if details and details.get("name"):
+                                entry["name"] = details.get("name") or entry["id"]
+                else:
+                    toppers = []
+                self.progress.emit({
+                    "stage": "orders",
+                    "customer_test_totals": toppers,
+                })
+
+                label_distribution = labels_future.result()
+                self.progress.emit({
+                    "stage": "labels",
+                    "tests_label_distribution": label_distribution,
+                })
+
+                (
+                    tests_total,
+                    tests_series,
+                    tat_sum_seconds,
+                    tat_count,
+                    tat_daily,
+                    tat_previous_daily,
+                ) = tests_future.result()
+                tests_series = list(tests_series or [])
+                tat_daily = list(tat_daily or [])
+                tat_previous_daily = list(tat_previous_daily or [])
+                aggregated_tests_series = self._aggregate_time_series(tests_series, self._timeframe)
+                self.progress.emit({
+                    "stage": "tests",
+                    "tests_total": tests_total,
+                    "tests_series": aggregated_tests_series,
+                    "tests_tat_sum": tat_sum_seconds,
+                    "tests_tat_count": tat_count,
+                    "tests_tat_daily": tat_daily,
+                    "tests_tat_daily_previous": tat_previous_daily,
+                    "timeframe": self._timeframe,
+                })
 
             summary = build_summary(
                 samples_total=samples_total,
@@ -298,6 +361,7 @@ class SummaryWorker(QObject):
 
 class OperationalWorker(QObject):
     finished = Signal(dict)
+    progress = Signal(dict)
     error = Signal(str)
 
     def __init__(
@@ -324,117 +388,160 @@ class OperationalWorker(QObject):
 
     def process(self) -> None:
         try:
-            throughput = self._client.fetch_order_throughput(
-                start_date=self._start_date,
-                end_date=self._end_date,
-                interval=self._timeframe,
-            )
-            cycle_time = self._client.fetch_sample_cycle_time(
-                start_date=self._start_date,
-                end_date=self._end_date,
-                interval="day" if self._timeframe == "day" else self._timeframe,
-            )
-            funnel = self._client.fetch_order_funnel(
-                start_date=self._start_date,
-                end_date=self._end_date,
-            )
-            slow_orders = self._client.fetch_slowest_orders(
-                start_date=self._start_date,
-                end_date=self._end_date,
-                limit=self._order_limit,
-            )
+            with ThreadPoolExecutor(max_workers=4) as executor:
+                throughput_future = executor.submit(
+                    self._client.fetch_order_throughput,
+                    start_date=self._start_date,
+                    end_date=self._end_date,
+                    interval=self._timeframe,
+                )
+                cycle_future = executor.submit(
+                    self._client.fetch_sample_cycle_time,
+                    start_date=self._start_date,
+                    end_date=self._end_date,
+                    interval="day" if self._timeframe == "day" else self._timeframe,
+                )
+                funnel_future = executor.submit(
+                    self._client.fetch_order_funnel,
+                    start_date=self._start_date,
+                    end_date=self._end_date,
+                )
+                slow_future = executor.submit(
+                    self._client.fetch_slowest_orders,
+                    start_date=self._start_date,
+                    end_date=self._end_date,
+                    limit=self._order_limit,
+                )
+
+                throughput = throughput_future.result()
+                totals = throughput.get("totals") if isinstance(throughput.get("totals"), dict) else {}
+                overview_payload = {
+                    "stage": "overview",
+                    "metrics": {
+                        "orders_completed": int(totals.get("orders_completed") or 0),
+                        "orders_created": int(totals.get("orders_created") or 0),
+                        "lead_time_average_hours": float(totals.get("average_completion_hours") or 0.0),
+                        "lead_time_median_hours": float(totals.get("median_completion_hours") or 0.0),
+                    },
+                }
+                self.progress.emit(overview_payload)
+
+                throughput_points: List[Dict[str, Any]] = []
+                for entry in throughput.get("points", []):
+                    if not isinstance(entry, dict):
+                        continue
+                    period = entry.get("period_start")
+                    if isinstance(period, datetime):
+                        normalized = self._normalize_datetime(period)
+                    else:
+                        normalized = None
+                    throughput_points.append({
+                        "period_start": normalized,
+                        "orders_created": int(entry.get("orders_created") or 0),
+                        "orders_completed": int(entry.get("orders_completed") or 0),
+                        "average_completion_hours": float(entry.get("average_completion_hours") or 0.0),
+                        "median_completion_hours": float(entry.get("median_completion_hours") or 0.0),
+                    })
+                self.progress.emit({
+                    "stage": "throughput",
+                    "timeframe": self._timeframe,
+                    "points": throughput_points,
+                })
+
+                cycle_time = cycle_future.result()
+                cycle_totals = cycle_time.get("totals") if isinstance(cycle_time.get("totals"), dict) else {}
+                cycle_points: List[Dict[str, Any]] = []
+                for entry in cycle_time.get("points", []):
+                    if not isinstance(entry, dict):
+                        continue
+                    period = entry.get("period_start")
+                    if isinstance(period, datetime):
+                        normalized = self._normalize_datetime(period)
+                    else:
+                        normalized = None
+                    cycle_points.append({
+                        "period_start": normalized,
+                        "completed_samples": int(entry.get("completed_samples") or 0),
+                        "average_cycle_hours": float(entry.get("average_cycle_hours") or 0.0),
+                        "median_cycle_hours": float(entry.get("median_cycle_hours") or 0.0),
+                    })
+                matrix_breakdown: List[Dict[str, Any]] = []
+                for entry in cycle_time.get("by_matrix_type", []):
+                    if not isinstance(entry, dict):
+                        continue
+                    matrix_breakdown.append({
+                        "matrix_type": entry.get("matrix_type") or "Unknown",
+                        "completed_samples": int(entry.get("completed_samples") or 0),
+                        "average_cycle_hours": float(entry.get("average_cycle_hours") or 0.0),
+                    })
+                self.progress.emit({
+                    "stage": "cycle",
+                    "timeframe": self._timeframe,
+                    "points": cycle_points,
+                    "matrix": matrix_breakdown,
+                    "metrics": {
+                        "samples_completed": int(cycle_totals.get("completed_samples") or 0),
+                        "sample_cycle_average_hours": float(cycle_totals.get("average_cycle_hours") or 0.0),
+                        "sample_cycle_median_hours": float(cycle_totals.get("median_cycle_hours") or 0.0),
+                    },
+                })
+
+                funnel = funnel_future.result()
+                funnel_stages: List[Dict[str, Any]] = []
+                for entry in funnel.get("stages", []):
+                    if not isinstance(entry, dict):
+                        continue
+                    funnel_stages.append({
+                        "stage": entry.get("stage") or "unknown",
+                        "count": int(entry.get("count") or 0),
+                    })
+                self.progress.emit({
+                    "stage": "funnel",
+                    "total_orders": int(funnel.get("total_orders") or 0),
+                    "stages": funnel_stages,
+                })
+
+                slow_orders = slow_future.result()
+                slowest_orders: List[Dict[str, Any]] = []
+                for entry in slow_orders:
+                    if not isinstance(entry, dict):
+                        continue
+                    slowest_orders.append({
+                        "order_id": entry.get("order_id") or entry.get("id") or "",
+                        "customer_name": entry.get("customer_name") or entry.get("customer") or "",
+                        "status": entry.get("status") or "",
+                        "completion_hours": float(entry.get("completion_hours") or 0.0),
+                        "age_hours": float(entry.get("age_hours") or 0.0),
+                    })
+                self.progress.emit({
+                    "stage": "slow_orders",
+                    "records": slowest_orders,
+                })
+
+            summary = {
+                "start_date": self._start_date if isinstance(self._start_date, datetime) else None,
+                "end_date": self._end_date if isinstance(self._end_date, datetime) else None,
+                "timeframe": self._timeframe,
+                "metrics": {
+                    "orders_completed": overview_payload["metrics"]["orders_completed"],
+                    "orders_created": overview_payload["metrics"]["orders_created"],
+                    "lead_time_average_hours": overview_payload["metrics"]["lead_time_average_hours"],
+                    "lead_time_median_hours": overview_payload["metrics"]["lead_time_median_hours"],
+                    "samples_completed": cycle_totals.get("completed_samples") or 0,
+                    "sample_cycle_average_hours": cycle_totals.get("average_cycle_hours") or 0.0,
+                    "sample_cycle_median_hours": cycle_totals.get("median_cycle_hours") or 0.0,
+                },
+                "throughput_points": throughput_points,
+                "cycle_points": cycle_points,
+                "cycle_by_matrix": matrix_breakdown,
+                "funnel_total": int(funnel.get("total_orders") or 0),
+                "funnel_stages": funnel_stages,
+                "slowest_orders": slowest_orders,
+            }
         except Exception as exc:  # pylint: disable=broad-except
             self.error.emit(str(exc))
-            return
-
-        throughput_points: List[Dict[str, Any]] = []
-        for entry in throughput.get("points", []):
-            if not isinstance(entry, dict):
-                continue
-            period = entry.get("period_start")
-            if isinstance(period, datetime):
-                normalized = self._normalize_datetime(period)
-            else:
-                normalized = None
-            throughput_points.append({
-                "period_start": normalized,
-                "orders_created": int(entry.get("orders_created") or 0),
-                "orders_completed": int(entry.get("orders_completed") or 0),
-                "average_completion_hours": float(entry.get("average_completion_hours") or 0.0),
-                "median_completion_hours": float(entry.get("median_completion_hours") or 0.0),
-            })
-
-        cycle_points: List[Dict[str, Any]] = []
-        for entry in cycle_time.get("points", []):
-            if not isinstance(entry, dict):
-                continue
-            period = entry.get("period_start")
-            if isinstance(period, datetime):
-                normalized = self._normalize_datetime(period)
-            else:
-                normalized = None
-            cycle_points.append({
-                "period_start": normalized,
-                "completed_samples": int(entry.get("completed_samples") or 0),
-                "average_cycle_hours": float(entry.get("average_cycle_hours") or 0.0),
-                "median_cycle_hours": float(entry.get("median_cycle_hours") or 0.0),
-            })
-
-        matrix_breakdown: List[Dict[str, Any]] = []
-        for entry in cycle_time.get("by_matrix_type", []):
-            if not isinstance(entry, dict):
-                continue
-            matrix_breakdown.append({
-                "matrix_type": entry.get("matrix_type") or "Unknown",
-                "completed_samples": int(entry.get("completed_samples") or 0),
-                "average_cycle_hours": float(entry.get("average_cycle_hours") or 0.0),
-            })
-
-        funnel_stages: List[Dict[str, Any]] = []
-        for entry in funnel.get("stages", []):
-            if not isinstance(entry, dict):
-                continue
-            funnel_stages.append({
-                "stage": entry.get("stage") or "unknown",
-                "count": int(entry.get("count") or 0),
-            })
-
-        slowest_orders: List[Dict[str, Any]] = []
-        for entry in slow_orders:
-            if not isinstance(entry, dict):
-                continue
-            slowest_orders.append({
-                "order_id": entry.get("order_id") or entry.get("id") or "",
-                "customer_name": entry.get("customer_name") or entry.get("customer") or "",
-                "status": entry.get("status") or "",
-                "completion_hours": float(entry.get("completion_hours") or 0.0),
-                "age_hours": float(entry.get("age_hours") or 0.0),
-            })
-
-        totals = throughput.get("totals") if isinstance(throughput.get("totals"), dict) else {}
-        cycle_totals = cycle_time.get("totals") if isinstance(cycle_time.get("totals"), dict) else {}
-
-        summary = {
-            "start_date": self._start_date if isinstance(self._start_date, datetime) else None,
-            "end_date": self._end_date if isinstance(self._end_date, datetime) else None,
-            "timeframe": self._timeframe,
-            "metrics": {
-                "orders_completed": int(totals.get("orders_completed") or 0),
-                "orders_created": int(totals.get("orders_created") or 0),
-                "lead_time_average_hours": float(totals.get("average_completion_hours") or 0.0),
-                "lead_time_median_hours": float(totals.get("median_completion_hours") or 0.0),
-                "samples_completed": int(cycle_totals.get("completed_samples") or 0),
-                "sample_cycle_average_hours": float(cycle_totals.get("average_cycle_hours") or 0.0),
-                "sample_cycle_median_hours": float(cycle_totals.get("median_cycle_hours") or 0.0),
-            },
-            "throughput_points": throughput_points,
-            "cycle_points": cycle_points,
-            "cycle_by_matrix": matrix_breakdown,
-            "funnel_total": int(funnel.get("total_orders") or 0),
-            "funnel_stages": funnel_stages,
-            "slowest_orders": slowest_orders,
-        }
-        self.finished.emit(summary)
+        else:
+            self.finished.emit(summary)
 
 
 class PriorityOrdersWorker(QObject):
@@ -499,6 +606,8 @@ class MainWindow(QMainWindow):
         self._priority_last_payload: Optional[Dict[str, Any]] = None
         self._priority_heatmap_periods: List[datetime] = []
         self._priority_heatmap_customers: List[str] = []
+        self._current_samples_series: List[Tuple[datetime, int]] = []
+        self._current_tests_series: List[Tuple[datetime, int]] = []
 
         self.setWindowTitle("MCRLabs Dashboard")
         self.resize(1280, 720)
@@ -752,6 +861,16 @@ class MainWindow(QMainWindow):
         table.setStyleSheet("QTableWidget { background-color: #0F172A; alternate-background-color: #17233D; color: #E0E8FF; }")
         table.setMinimumHeight(200)
         return table
+
+    def _set_table_loading(self, table: QTableWidget, message: str = "Loading...") -> None:
+        table.clearContents()
+        if table.columnCount() == 0:
+            table.setColumnCount(1)
+        table.setRowCount(1)
+        table.setSpan(0, 0, 1, table.columnCount())
+        item = QTableWidgetItem(message)
+        item.setTextAlignment(Qt.AlignCenter)
+        table.setItem(0, 0, item)
 
     def _create_list_panel(self, title: str, content_widget: QWidget) -> QFrame:
         frame = QFrame()
@@ -1383,6 +1502,20 @@ class MainWindow(QMainWindow):
         if self._loading:
             return
         self._set_loading(True)
+        placeholder = "…"
+        self.samples_value.setText(placeholder)
+        self.tests_value.setText(placeholder)
+        self.customers_value.setText(placeholder)
+        self.reports_value.setText(placeholder)
+        self.tat_value.setText(placeholder)
+        self._current_samples_series = []
+        self._current_tests_series = []
+        self._update_main_chart_data([], [], self._timeframe_mode)
+        self._update_tat_chart([], [])
+        self._update_test_type_chart([])
+        self._set_table_loading(self.new_customers_table, "Loading…")
+        self._set_table_loading(self.top_tests_table, "Loading…")
+
         status_message = "Updating..."
         range_text = self._format_range(start_dt, end_dt)
         if range_text:
@@ -1406,6 +1539,7 @@ class MainWindow(QMainWindow):
         self._thread.finished.connect(self._thread.deleteLater)
         self._worker.finished.connect(self._worker.deleteLater)
         self._worker.error.connect(self._worker.deleteLater)
+        self._worker.progress.connect(self._on_worker_progress)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.error.connect(self._on_worker_error)
         self._thread.finished.connect(self._on_thread_finished)
@@ -1444,6 +1578,74 @@ class MainWindow(QMainWindow):
         self._timeframe_manual_override = True
         self._restart_with_current_range()
 
+    def _on_worker_progress(self, payload: Dict[str, Any]) -> None:
+        stage = payload.get("stage")
+        if not stage:
+            return
+
+        stage_messages = {
+            "overview": "Cargando métricas principales...",
+            "tests": "Cargando estadísticas de tests...",
+            "customers": "Loading recent customers...",
+            "orders": "Loading customer leaderboard...",
+            "labels": "Cargando distribución de etiquetas...",
+        }
+        message = stage_messages.get(stage)
+        if message:
+            self._update_status(message)
+
+        if stage == "overview":
+            samples_total = payload.get("samples_total")
+            if samples_total is not None:
+                self.samples_value.setText(str(int(samples_total)))
+            reports_total = payload.get("reports_total")
+            if reports_total is not None:
+                self.reports_value.setText(str(int(reports_total)))
+            samples_series = list(payload.get("samples_series") or [])
+            self._current_samples_series = samples_series
+            timeframe = payload.get("timeframe") or self._timeframe_mode
+            self._current_timeframe_mode = timeframe
+            self._update_main_chart_data(samples_series, self._current_tests_series, timeframe)
+            return
+
+        if stage == "tests":
+            tests_total = payload.get("tests_total")
+            if tests_total is not None:
+                self.tests_value.setText(str(int(tests_total)))
+            tat_sum = float(payload.get("tests_tat_sum") or 0.0)
+            tat_count = int(payload.get("tests_tat_count") or 0)
+            self.tat_value.setText(self._format_tat(tat_sum, tat_count))
+            tests_series = list(payload.get("tests_series") or [])
+            self._current_tests_series = tests_series
+            timeframe = payload.get("timeframe") or self._timeframe_mode
+            self._current_timeframe_mode = timeframe
+            self._update_main_chart_data(self._current_samples_series, tests_series, timeframe)
+            tat_daily = payload.get("tests_tat_daily") or []
+            tat_previous = payload.get("tests_tat_daily_previous") or []
+            self._update_tat_chart(tat_daily, tat_previous)
+            return
+
+        if stage == "customers":
+            total = payload.get("customers_total")
+            if total is not None:
+                self.customers_value.setText(str(int(total)))
+            records = payload.get("customers_recent")
+            if isinstance(records, list):
+                self._update_new_customers(records)
+            return
+
+        if stage == "orders":
+            records = payload.get("customer_test_totals")
+            if isinstance(records, list):
+                self._update_top_tests(records)
+            return
+
+        if stage == "labels":
+            distribution = payload.get("tests_label_distribution")
+            if isinstance(distribution, list):
+                self._update_test_type_chart(distribution)
+            return
+
     def _on_worker_finished(self, summary: Dict[str, object]) -> None:
         self._apply_summary(summary)
 
@@ -1454,6 +1656,56 @@ class MainWindow(QMainWindow):
         self._set_loading(False)
         self._worker = None
         self._thread = None
+
+    def _update_main_chart_data(
+        self,
+        samples_series: Sequence[Tuple[datetime, int]],
+        tests_series: Sequence[Tuple[datetime, int]],
+        timeframe: Optional[str],
+    ) -> None:
+        bucket_counts: Dict[datetime, List[float]] = {}
+        for dt_value, count in samples_series:
+            normalized = self._ensure_utc_datetime(dt_value)
+            if not normalized:
+                continue
+            bucket_counts.setdefault(normalized, [0.0, 0.0])[0] = float(count)
+        for dt_value, count in tests_series:
+            normalized = self._ensure_utc_datetime(dt_value)
+            if not normalized:
+                continue
+            bucket_counts.setdefault(normalized, [0.0, 0.0])[1] = float(count)
+
+        self.samples_set.remove(0, self.samples_set.count())
+        self.tests_set.remove(0, self.tests_set.count())
+
+        sorted_buckets = sorted(bucket_counts.keys())
+        category_labels: List[str] = []
+        max_value = 1.0
+        effective_timeframe = timeframe or self._current_timeframe_mode
+        for bucket in sorted_buckets:
+            sample_count, test_count = bucket_counts[bucket]
+            category_labels.append(self._format_category_label(bucket, effective_timeframe))
+            self.samples_set.append(sample_count)
+            self.tests_set.append(test_count)
+            max_value = max(max_value, sample_count, test_count)
+
+        if not category_labels:
+            reference = datetime.now(timezone.utc)
+            category_labels = [self._format_category_label(reference, effective_timeframe)]
+            self.samples_set.append(0.0)
+            self.tests_set.append(0.0)
+            max_value = 1.0
+
+        self.categories_axis.clear()
+        self.categories_axis.append(category_labels)
+        axis_title = {
+            "daily": "Fecha",
+            "weekly": "Semana",
+            "monthly": "Mes",
+        }.get(effective_timeframe, "Fecha")
+        self.categories_axis.setTitleText(axis_title)
+        self.bar_series.setBarWidth(0.4)
+        self.value_axis.setRange(0, max_value + 1)
 
 
 
@@ -1518,51 +1770,11 @@ class MainWindow(QMainWindow):
             status_parts.append(f"Timeframe: {timeframe_label}")
         self._update_status(" | ".join(status_parts))
 
-        samples_series = summary.get("samples_series") or []
-        tests_series = summary.get("tests_series") or []
-
-        bucket_counts: Dict[datetime, List[int]] = {}
-        for dt_value, count in samples_series:
-            normalized = self._ensure_utc_datetime(dt_value)
-            if not normalized:
-                continue
-            bucket_counts.setdefault(normalized, [0, 0])[0] = int(count)
-        for dt_value, count in tests_series:
-            normalized = self._ensure_utc_datetime(dt_value)
-            if not normalized:
-                continue
-            bucket_counts.setdefault(normalized, [0, 0])[1] = int(count)
-
-        self.samples_set.remove(0, self.samples_set.count())
-        self.tests_set.remove(0, self.tests_set.count())
-
-        sorted_buckets = sorted(bucket_counts.keys())
-        category_labels = []
-        max_value = 1
-        for bucket in sorted_buckets:
-            sample_count, test_count = bucket_counts[bucket]
-            category_labels.append(self._format_category_label(bucket, self._current_timeframe_mode))
-            self.samples_set.append(float(sample_count))
-            self.tests_set.append(float(test_count))
-            max_value = max(max_value, sample_count, test_count)
-
-        if not category_labels:
-            reference = datetime.now(timezone.utc)
-            category_labels = [self._format_category_label(reference, self._current_timeframe_mode)]
-            self.samples_set.append(0.0)
-            self.tests_set.append(0.0)
-            max_value = 1
-
-        self.categories_axis.clear()
-        self.categories_axis.append(category_labels)
-        axis_title = {
-            "daily": "Fecha",
-            "weekly": "Semana",
-            "monthly": "Mes",
-        }.get(self._current_timeframe_mode, "Fecha")
-        self.categories_axis.setTitleText(axis_title)
-        self.bar_series.setBarWidth(0.4)
-        self.value_axis.setRange(0, max_value + 1)
+        samples_series = list(summary.get("samples_series") or [])
+        tests_series = list(summary.get("tests_series") or [])
+        self._current_samples_series = samples_series
+        self._current_tests_series = tests_series
+        self._update_main_chart_data(samples_series, tests_series, self._current_timeframe_mode)
 
     def _on_bar_hover(self, status: bool, index: int, bar_set: QBarSet) -> None:
         if not status or index < 0:
@@ -1680,6 +1892,9 @@ class MainWindow(QMainWindow):
         self._operational_timeframe_combo.setCurrentIndex(1)
         self._operational_timeframe_combo.currentIndexChanged.connect(self._on_operational_timeframe_changed)
         self._operational_timeframe_mode = self._operational_timeframe_combo.currentData()
+        self._operational_current_timeframe_mode = self._operational_timeframe_mode  # type: ignore[assignment]
+        self._operational_timeframe_mode = self._operational_timeframe_combo.currentData()
+        self._operational_current_timeframe_mode = self._operational_timeframe_mode  # type: ignore[assignment]
         self._operational_current_timeframe_mode = self._operational_timeframe_mode  # type: ignore[assignment]
 
         self.op_refresh_button = QPushButton("Refresh")
@@ -1959,6 +2174,13 @@ class MainWindow(QMainWindow):
         table_panel = self._create_list_panel("Most overdue orders", self.priority_orders_table)
         table_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
+        self.priority_ready_table = self._create_table_widget(
+            ["Sample", "Order", "Customer", "Completed", "Tests"]
+        )
+        self.priority_ready_table.setMinimumHeight(260)
+        ready_panel = self._create_list_panel("Ready to report samples", self.priority_ready_table)
+        ready_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+
         chart_panel = QFrame()
         chart_panel.setFrameShape(QFrame.StyledPanel)
         chart_panel.setStyleSheet(
@@ -2010,7 +2232,7 @@ class MainWindow(QMainWindow):
         row_layout = QHBoxLayout()
         row_layout.setSpacing(16)
         row_layout.addWidget(table_panel, 1)
-        row_layout.addWidget(chart_panel, 1)
+        row_layout.addWidget(ready_panel, 1)
         layout.addLayout(row_layout, 1)
 
         heatmap_panel = QFrame()
@@ -2046,7 +2268,11 @@ class MainWindow(QMainWindow):
         self.priority_heatmap_table.setMinimumHeight(220)
         heatmap_layout.addWidget(self.priority_heatmap_table)
 
-        layout.addWidget(heatmap_panel, 1)
+        heatmap_row = QHBoxLayout()
+        heatmap_row.setSpacing(16)
+        heatmap_row.addWidget(heatmap_panel, 1)
+        heatmap_row.addWidget(chart_panel, 1)
+        layout.addLayout(heatmap_row, 1)
 
         layout.addStretch()
         return tab
@@ -2205,7 +2431,13 @@ class MainWindow(QMainWindow):
         self.priority_min_days_spin.setEnabled(not loading)
         self.priority_sla_hours_spin.setEnabled(not loading)
         if loading:
-            self._update_priority_status("Loading overdue orders…")
+            self._update_priority_status("Loading priority orders…")
+            self._set_table_loading(self.priority_orders_table)
+            if hasattr(self, "priority_ready_table"):
+                self._set_table_loading(self.priority_ready_table)
+            self.priority_timeline_series.clear()
+            self.priority_heatmap_table.clearContents()
+            self.priority_heatmap_table.setRowCount(0)
 
     def _update_priority_status(self, message: str) -> None:
         self.priority_status_label.setText(message)
@@ -2232,6 +2464,7 @@ class MainWindow(QMainWindow):
         self._update_priority_table(payload.get("top_orders", []))
         self._update_priority_chart(payload.get("timeline", []))
         self._update_priority_heatmap(payload.get("heatmap", []))
+        self._update_ready_samples(payload.get("ready_to_report_samples", []))
         params = payload.get("params", {})
         start_text = params.get("date_from")
         end_text = params.get("date_to")
@@ -2286,6 +2519,36 @@ class MainWindow(QMainWindow):
 
         if table.rowCount() == 0:
             self._update_priority_status("No overdue orders found in the last 30 days.")
+
+    def _update_ready_samples(self, records: Sequence[Dict[str, Any]]) -> None:
+        table = self.priority_ready_table
+        table.setRowCount(0)
+        if not isinstance(records, Sequence) or not records:
+            self._set_table_loading(table, "No ready samples")
+            return
+        for entry in records:
+            if not isinstance(entry, dict):
+                continue
+            sample_display = (
+                entry.get("sample_custom_id")
+                or entry.get("sample_name")
+                or entry.get("sample_id")
+                or ""
+            )
+            order_display = entry.get("order_custom_id") or entry.get("order_id") or ""
+            customer = entry.get("customer_name") or ""
+            completed = entry.get("completed_date")
+            tests_ready = int(entry.get("tests_ready_count") or 0)
+            tests_total = int(entry.get("tests_total_count") or 0)
+
+            row = table.rowCount()
+            table.insertRow(row)
+            table.setItem(row, 0, QTableWidgetItem(str(sample_display)))
+            table.setItem(row, 1, QTableWidgetItem(str(order_display)))
+            table.setItem(row, 2, QTableWidgetItem(str(customer)))
+            table.setItem(row, 3, QTableWidgetItem(self._format_priority_timestamp(completed)))
+            table.setItem(row, 4, QTableWidgetItem(f"{tests_ready}/{tests_total}"))
+        table.resizeColumnsToContents()
 
     def _update_priority_chart(self, points: Sequence[Dict[str, Any]]) -> None:
         self.priority_timeline_series.clear()
