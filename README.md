@@ -28,6 +28,13 @@ python app.py
 
 Configura las variables de entorno requeridas en `.env` (ver `qbench_dashboard/config.py`).
 
+### Opciones de DATA_PROVIDER
+- `qbench`: usa las credenciales OAuth de QBench y la API remota oficial.
+- `local`: apunta al servicio local (`http://localhost:8000`) pensado para desarrollo.
+- `online`: reutiliza los mismos endpoints que `local` pero con el tunel remoto `https://6v12xcxn-8000.use.devtunnels.ms`.
+
+En todos los casos se puede sobrescribir `LOCAL_API_BASE_URL` en `.env`; el valor se normaliza automaticamente para eliminar un `/` final si estuviera presente.
+
 ## Estructura principal
 ```
 app.py                     # Punto de entrada

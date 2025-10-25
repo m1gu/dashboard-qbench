@@ -7,6 +7,11 @@ from dotenv import load_dotenv
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT.parent / ".env")
 
+DEFAULT_LOCAL_BASE_URLS = {
+    "local": "http://localhost:8000",
+    "online": "https://6v12xcxn-8000.use.devtunnels.ms",
+}
+
 
 @dataclass
 class QBenchSettings:
@@ -50,10 +55,13 @@ def get_qbench_settings() -> QBenchSettings:
 
 
 def get_local_api_settings() -> LocalAPISettings:
-    base_url = os.getenv("LOCAL_API_BASE_URL", "http://localhost:8000").rstrip("/")
+    provider = get_data_provider()
+    default_base = DEFAULT_LOCAL_BASE_URLS.get(provider, DEFAULT_LOCAL_BASE_URLS["local"])
+    base_value = os.getenv("LOCAL_API_BASE_URL", default_base)
+    base_url = base_value.rstrip("/")
     return LocalAPISettings(base_url=base_url)
 
 
 def get_data_provider() -> str:
-    """Returns the configured data provider: 'qbench' or 'local'"""
+    """Returns the configured data provider: 'qbench', 'local' or 'online'"""
     return os.getenv("DATA_PROVIDER", "qbench").lower()

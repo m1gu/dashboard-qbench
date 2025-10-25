@@ -8,7 +8,7 @@ def create_data_client() -> DataClientInterface:
     """Factory function to create the appropriate data client based on configuration."""
     provider = get_data_provider()
     
-    if provider == "local":
+    if provider in {"local", "online"}:
         try:
             return LocalAPIClient()
         except Exception as exc:
@@ -19,4 +19,6 @@ def create_data_client() -> DataClientInterface:
         except Exception as exc:
             raise QBenchError(f"Failed to initialize QBench client: {exc}") from exc
     else:
-        raise ValueError(f"Unknown data provider: {provider}. Valid options are 'qbench' and 'local'.")
+        raise ValueError(
+            f"Unknown data provider: {provider}. Valid options are 'qbench', 'local' and 'online'."
+        )
