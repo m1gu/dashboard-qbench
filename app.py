@@ -6,7 +6,7 @@ from qbench_dashboard.config import get_data_provider, get_local_api_settings, i
 from qbench_dashboard.services.client_factory import create_data_client
 from qbench_dashboard.services.qbench_client import QBenchError
 from qbench_dashboard.services.local_api_client import LocalAPIError
-from qbench_dashboard.ui.main_window import launch_app
+from qbench_dashboard.ui.main_window import launch_app, _load_window_icon
 from qbench_dashboard.services.connectivity import ConnectivityError, ensure_online_connectivity
 
 
@@ -20,6 +20,9 @@ def main() -> None:
         client = create_data_client()
     except (RuntimeError, QBenchError, LocalAPIError, ValueError, ConnectivityError) as exc:
         app = QApplication.instance() or QApplication([])
+        icon = _load_window_icon()
+        if not icon.isNull():
+            app.setWindowIcon(icon)
         QMessageBox.critical(None, "Configuracion invalida", str(exc))
         sys.exit(1)
     launch_app(client)

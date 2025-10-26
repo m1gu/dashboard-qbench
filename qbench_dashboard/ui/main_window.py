@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone, timedelta
+from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from PySide6.QtCharts import (
@@ -17,7 +19,7 @@ from PySide6.QtCharts import (
     QValueAxis,
 )
 from PySide6.QtCore import QDate, QDateTime, QLocale, QMargins, QTimer, Qt, QThread, QObject, Signal
-from PySide6.QtGui import QBrush, QCursor, QColor, QGradient, QLinearGradient, QPalette, QPainter, QPen
+from PySide6.QtGui import QBrush, QCursor, QColor, QGradient, QIcon, QLinearGradient, QPalette, QPainter, QPen
 from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
@@ -46,6 +48,21 @@ from PySide6.QtWidgets import (
 
 from qbench_dashboard.services.client_interface import DataClientInterface
 from qbench_dashboard.services.summary import build_summary
+
+_WINDOW_ICON: Optional[QIcon] = None
+
+
+def _resource_path(relative: str) -> Path:
+    base_dir = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parent.parent.parent))
+    return base_dir / relative
+
+
+def _load_window_icon() -> QIcon:
+    global _WINDOW_ICON
+    if _WINDOW_ICON is None:
+        icon_path = _resource_path("resources/icons/MCRLabs.ico")
+        _WINDOW_ICON = QIcon(str(icon_path)) if icon_path.exists() else QIcon()
+    return _WINDOW_ICON
 
 
 class SummaryWorker(QObject):
@@ -610,6 +627,9 @@ class MainWindow(QMainWindow):
         self._current_tests_series: List[Tuple[datetime, int]] = []
 
         self.setWindowTitle("MCRLabs Dashboard")
+        icon = _load_window_icon()
+        if not icon.isNull():
+            self.setWindowIcon(icon)
         self.resize(1280, 720)
         self._apply_dark_palette()
 
@@ -2952,7 +2972,12 @@ class MainWindow(QMainWindow):
 
 def launch_app(client: DataClientInterface) -> None:
     app = QApplication.instance() or QApplication([])
+    icon = _load_window_icon()
+    if not icon.isNull():
+        app.setWindowIcon(icon)
     window = MainWindow(client)
+    if not icon.isNull():
+        window.setWindowIcon(icon)
     window.show()
     window.refresh_data()
     app.exec()
