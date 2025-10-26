@@ -676,13 +676,13 @@ class MainWindow(QMainWindow):
 
         self.categories_axis = QBarCategoryAxis()
         self.categories_axis.setLabelsColor(Qt.white)
-        self.categories_axis.setTitleText("Fecha")
+        self.categories_axis.setTitleText("Date")
         self.categories_axis.setTitleBrush(Qt.white)
 
         self.value_axis = QValueAxis()
         self.value_axis.setLabelFormat("%d")
         self.value_axis.setLabelsColor(Qt.white)
-        self.value_axis.setTitleText("Conteo")
+        self.value_axis.setTitleText("Count")
         self.value_axis.setTitleBrush(Qt.white)
 
         self.chart.addAxis(self.categories_axis, Qt.AlignBottom)
@@ -1699,10 +1699,10 @@ class MainWindow(QMainWindow):
         self.categories_axis.clear()
         self.categories_axis.append(category_labels)
         axis_title = {
-            "daily": "Fecha",
-            "weekly": "Semana",
-            "monthly": "Mes",
-        }.get(effective_timeframe, "Fecha")
+            "daily": "Date",
+            "weekly": "Week",
+            "monthly": "Month",
+        }.get(effective_timeframe, "Date")
         self.categories_axis.setTitleText(axis_title)
         self.bar_series.setBarWidth(0.4)
         self.value_axis.setRange(0, max_value + 1)

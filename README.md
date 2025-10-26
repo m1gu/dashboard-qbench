@@ -33,7 +33,7 @@ Configura las variables de entorno requeridas en `.env` (ver `qbench_dashboard/c
 - `local`: apunta al servicio local (`http://localhost:8000`) pensado para desarrollo.
 - `online`: reutiliza los mismos endpoints que `local` pero con el tunel remoto `https://615c98lc-8000.use.devtunnels.ms`.
 
-En todos los casos se puede sobrescribir `LOCAL_API_BASE_URL` en `.env`; el valor se normaliza automaticamente para eliminar un `/` final si estuviera presente.
+En todos los casos se puede sobrescribir la URL base en `.env`: usa `LOCAL_API_BASE_URL` cuando `DATA_PROVIDER=local` y `ONLINE_API_BASE_URL` cuando `DATA_PROVIDER=online` (con retrocompatibilidad hacia `LOCAL_API_BASE_URL`). El valor se normaliza automaticamente para eliminar un `/` final si estuviera presente.
 
 ## Estructura principal
 ```

@@ -13,6 +13,11 @@ DEFAULT_LOCAL_BASE_URLS = {
     "online": "https://615c98lc-8000.use.devtunnels.ms",
 }
 
+PROVIDER_ENV_VARS = {
+    "local": "LOCAL_API_BASE_URL",
+    "online": "ONLINE_API_BASE_URL",
+}
+
 
 @dataclass
 class QBenchSettings:
@@ -58,8 +63,12 @@ def get_qbench_settings() -> QBenchSettings:
 def get_local_api_settings() -> LocalAPISettings:
     provider = get_data_provider()
     default_base = DEFAULT_LOCAL_BASE_URLS.get(provider, DEFAULT_LOCAL_BASE_URLS["local"])
-    base_value = os.getenv("LOCAL_API_BASE_URL", default_base)
-    base_url = base_value.rstrip("/")
+    env_var = PROVIDER_ENV_VARS.get(provider, "LOCAL_API_BASE_URL")
+    base_value = os.getenv(env_var, "").strip()
+    if not base_value and provider == "online":
+        # Fall back to the local variable for compatibility with existing setups.
+        base_value = os.getenv("LOCAL_API_BASE_URL", "").strip()
+    base_url = (base_value or default_base).rstrip("/")
     return LocalAPISettings(base_url=base_url)
 
 
