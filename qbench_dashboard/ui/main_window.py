@@ -618,8 +618,8 @@ class MainWindow(QMainWindow):
         self._priority_loading = False
         self._priority_initialized = False
         self._priority_top_limit = 25
-        self._priority_min_days_default = 5
-        self._priority_sla_hours_default = 240
+        self._priority_min_days_default = 4
+        self._priority_sla_hours_default = 120
         self._priority_last_payload: Optional[Dict[str, Any]] = None
         self._priority_heatmap_periods: List[datetime] = []
         self._priority_heatmap_customers: List[str] = []
